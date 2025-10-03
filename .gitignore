@@ -49,7 +49,6 @@ ENV/
 .ipynb_checkpoints
 
 # Datasets
-dataset/
 *.zip
 *.tar
 *.tar.gz
