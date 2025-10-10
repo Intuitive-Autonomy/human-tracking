@@ -31,6 +31,7 @@ from collections import deque
 import threading
 import subprocess
 import pickle
+import time
 
 # Import PyTorch components first
 from torchvision import transforms
@@ -63,6 +64,13 @@ class RealtimeSTCNTracker(Node):
         self.camera_01_img = None
         self.camera_02_img = None
         self.last_timestamp = None
+
+        # Performance tracking
+        self.fps_start_time = time.time()
+        self.fps_frame_count = 0
+        self.processing_times = deque(maxlen=30)  # Last 30 frames
+        self.inference_times = deque(maxlen=30)  # Model inference only
+        self.last_fps_print = time.time()
 
         # Tracking state
         self.tracking_initialized = False
@@ -186,7 +194,7 @@ class RealtimeSTCNTracker(Node):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,  # Ignore stderr
                     bufsize=0,
-                    cwd='/home/oliver/Documents/STCN'
+                    cwd='/home/choon/Documents/human-tracking'
                 )
                 # Wait for READY signal from stdout
                 import select
@@ -353,6 +361,9 @@ class RealtimeSTCNTracker(Node):
         if not hasattr(self, 'pad') or self.pad is None:
             self.pad = current_pad
 
+        # START INFERENCE TIMING
+        inference_start = time.time()
+
         with torch.amp.autocast('cuda', enabled=True):
             # Encode query frame
             k16, qv16, qf16, qf8, qf4 = self.stcn_model.encode_key(frame_cuda[:,0])
@@ -398,6 +409,10 @@ class RealtimeSTCNTracker(Node):
                     bank.add_memory(prev_key, prev_value[i:i+1])
 
                 self.last_mem_ti = self.current_frame_idx
+
+        # END INFERENCE TIMING (record before post-processing)
+        inference_time = time.time() - inference_start
+        self.inference_times.append(inference_time)
 
         # Get final mask (foreground only, sum all object channels)
         # out_mask shape: (k+1, 1, H, W), we want objects only (index 1 onwards)
@@ -475,6 +490,8 @@ class RealtimeSTCNTracker(Node):
 
     def process_frame(self):
         """Main processing loop"""
+        frame_start_time = time.time()
+
         with self.lock:
             if self.camera_01_img is None or self.camera_02_img is None:
                 return
@@ -627,6 +644,22 @@ class RealtimeSTCNTracker(Node):
             self.visualize(frame_rgb, mask)
 
         self.current_frame_idx += 1
+
+        # Calculate and display performance metrics
+        frame_time = time.time() - frame_start_time
+        self.processing_times.append(frame_time)
+        self.fps_frame_count += 1
+
+        # Print FPS every 2 seconds
+        if time.time() - self.last_fps_print >= 2.0:
+            avg_time = np.mean(self.processing_times) if len(self.processing_times) > 0 else 0
+            avg_inference = np.mean(self.inference_times) if len(self.inference_times) > 0 else 0
+            fps = 1.0 / avg_time if avg_time > 0 else 0
+            latency_ms = avg_time * 1000
+            inference_ms = avg_inference * 1000
+
+            self.get_logger().info(f"Performance: {fps:.1f} FPS | Total: {latency_ms:.1f}ms | STCN Inference: {inference_ms:.1f}ms (avg last 30)")
+            self.last_fps_print = time.time()
 
     def __del__(self):
         """清理资源"""

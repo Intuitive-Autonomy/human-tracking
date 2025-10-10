@@ -2,8 +2,12 @@
 # ROS2 STCN Tracker启动脚本
 # 解决库冲突问题
 
+# Set display for GUI applications
+export DISPLAY=:0
+
 # 优先使用系统库，避免conda库冲突
-export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtiff.so.5
+# Skip LD_PRELOAD on ARM64 - library path is different
+# export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtiff.so.5
 
 # CUDA相关设置，避免重复注册
 export CUDA_MODULE_LOADING=LAZY
@@ -32,5 +36,5 @@ echo "  - /camera_02/color/image_raw"
 echo ""
 
 # 运行tracker
-cd /home/oliver/Documents/STCN
+cd /home/choon/Documents/human-tracking
 python3 -u realtime_stcn_tracking.py 2>&1
