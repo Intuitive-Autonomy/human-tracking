@@ -97,11 +97,11 @@ class RealtimeSTCNTracker(Node):
         # Note: Old torchvision transforms replaced with optimized GPU preprocessing in frame_to_tensor()
 
         # Limit GPU memory usage to avoid conflicts with other processes
-        if torch.cuda.is_available():
-            # Limit to ~2GB (25% of 8GB GPU) - need more for stable tracking
-            torch.cuda.set_per_process_memory_fraction(0.25, device=0)
-            torch.cuda.empty_cache()
-            self.get_logger().info(f"GPU memory limited to ~2GB")
+        # if torch.cuda.is_available():
+        #     # Limit to ~2GB (25% of 8GB GPU) - need more for stable tracking
+        #     torch.cuda.set_per_process_memory_fraction(0.25, device=0)
+        #     torch.cuda.empty_cache()
+        #     self.get_logger().info(f"GPU memory limited to ~2GB")
 
         # Use subprocess for YOLO to isolate CUDA context
         self.get_logger().info("YOLO will run in isolated subprocess...")
@@ -137,6 +137,13 @@ class RealtimeSTCNTracker(Node):
         )
         self.sub_cam02 = self.create_subscription(
             Image, '/camera_02/color/image_raw', self.callback_cam02, qos_profile
+        )
+
+        # Publisher for human mask
+        self.mask_publisher = self.create_publisher(
+            Image,
+            '/human_mask',
+            10
         )
 
         # Timer for processing
@@ -552,8 +559,8 @@ class RealtimeSTCNTracker(Node):
         cv2.putText(display, f"{status} | Frame: {self.current_frame_idx} | FPS: {current_fps:.1f}",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        cv2.imshow('STCN Real-time Tracking', display)
-        cv2.waitKey(1)
+        # cv2.imshow('STCN Real-time Tracking', display)
+        # cv2.waitKey(1)
 
         self.viz_times.append(time.time() - viz_start)
 
@@ -712,6 +719,15 @@ class RealtimeSTCNTracker(Node):
         if mask is not None:
             self.visualize(frame_rgb, mask)
 
+            # Publish mask as ROS Image message
+            try:
+                mask_msg = self.bridge.cv2_to_imgmsg(mask, encoding='mono8')
+                mask_msg.header.stamp = self.get_clock().now().to_msg()
+                mask_msg.header.frame_id = 'camera_stitched'
+                self.mask_publisher.publish(mask_msg)
+            except Exception as e:
+                self.get_logger().error(f"Failed to publish mask: {e}")
+
         self.current_frame_idx += 1
 
         # Calculate and display performance metrics
@@ -761,6 +777,6 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
     finally:
-        cv2.destroyAllWindows()
+        # cv2.destroyAllWindows()
         tracker.destroy_node()
         rclpy.shutdown()
