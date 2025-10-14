@@ -94,7 +94,8 @@ class RealtimeSTCNTracker(Node):
         self.get_logger().info("Loading STCN model...")
         torch.autograd.set_grad_enabled(False)
         self.stcn_model = STCN().cuda().eval()
-        model_path = "saves/stcn.pth"
+        current_file_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(current_file_dir, "saves", "stcn.pth")
         prop_saved = torch.load(model_path, weights_only=False)
 
         # Handle stage 0 model compatibility
@@ -109,18 +110,27 @@ class RealtimeSTCNTracker(Node):
 
         # QoS profile for image topics
         qos_profile = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+            reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
 
         # Subscribers
         self.sub_cam01 = self.create_subscription(
-            Image, '/camera_01/color/image_raw', self.callback_cam01, qos_profile
+            Image, '/rgb_cam1', self.callback_cam01, qos_profile
         )
         self.sub_cam02 = self.create_subscription(
-            Image, '/camera_02/color/image_raw', self.callback_cam02, qos_profile
+            Image, '/rgb_cam0', self.callback_cam02, qos_profile
         )
+
+        # Publisher for concatenated human masks (both cameras in one image)
+        # Format: vertically stacked [cam1_mask | cam0_mask]
+        self.mask_concatenated_publisher = self.create_publisher(
+            Image, '/human_masks_dual', qos_profile
+        )
+        
+        # Store stitching metadata for unwarping masks
+        self.stitch_meta = None
 
         # Timer for processing
         self.timer = self.create_timer(0.033, self.process_frame)  # ~30 Hz
@@ -132,6 +142,7 @@ class RealtimeSTCNTracker(Node):
             img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             with self.lock:
                 self.camera_01_img = img
+                self.last_timestamp = msg.header.stamp
         except Exception as e:
             self.get_logger().error(f"Failed to convert camera_01 image: {e}")
 
@@ -140,26 +151,49 @@ class RealtimeSTCNTracker(Node):
             img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             with self.lock:
                 self.camera_02_img = img
+                # Only update timestamp if cam01 hasn't set it yet
+                if self.last_timestamp is None:
+                    self.last_timestamp = msg.header.stamp
         except Exception as e:
             self.get_logger().error(f"Failed to convert camera_02 image: {e}")
 
-    def stitch_images(self, img_top, img_bottom):
-        """上下摄像头透视变换后拼接"""
-        # Warp top camera
-        h0, w0 = img_top.shape[:2]
-        src0 = np.float32([[0, 0], [w0, 0], [w0, h0], [0, h0]])
-        offset0 = int(w0 * self.angle_degrees / 90)
-        dst0 = np.float32([[0, 0], [w0, 0], [w0 - offset0, h0], [offset0, h0]])
-        M0 = cv2.getPerspectiveTransform(src0, dst0)
-        warped_top = cv2.warpPerspective(img_top, M0, (w0, h0))
+    def correct_camera_perspective_with_meta(self, image, camera_id):
+        """
+        Warp a single camera image with perspective transform and return metadata
+        for later mask unwarping.
+        
+        Returns:
+            warped, meta dict with keys: 'M', 'orig_size', 'warped_size', 'camera_id'
+        """
+        h, w = image.shape[:2]
+        src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+        offset = int(w * self.angle_degrees / 90)
 
-        # Warp bottom camera
-        h1, w1 = img_bottom.shape[:2]
-        src1 = np.float32([[0, 0], [w1, 0], [w1, h1], [0, h1]])
-        offset1 = int(w1 * self.angle_degrees / 90)
-        dst1 = np.float32([[offset1, 0], [w1 - offset1, 0], [w1, h1], [0, h1]])
-        M1 = cv2.getPerspectiveTransform(src1, dst1)
-        warped_bottom = cv2.warpPerspective(img_bottom, M1, (w1, h1))
+        if camera_id == 0:  # Top camera (cam1), narrow bottom
+            dst = np.float32([[0, 0], [w, 0], [w - offset, h], [offset, h]])
+        else:  # Bottom camera (cam0), narrow top
+            dst = np.float32([[offset, 0], [w - offset, 0], [w, h], [0, h]])
+
+        M = cv2.getPerspectiveTransform(src, dst)
+        warped = cv2.warpPerspective(image, M, (w, h))
+
+        meta = {
+            'M': M.astype(np.float32),
+            'orig_size': (h, w),
+            'warped_size': (h, w),
+            'camera_id': camera_id
+        }
+        return warped, meta
+
+    def stitch_images(self, img_top, img_bottom):
+        """
+        上下摄像头透视变换后拼接，同时保存metadata用于后续mask反变换
+        img_top = camera_01 = cam1
+        img_bottom = camera_02 = cam0
+        """
+        # Warp both cameras
+        warped_top, meta_top = self.correct_camera_perspective_with_meta(img_top, 0)
+        warped_bottom, meta_bottom = self.correct_camera_perspective_with_meta(img_bottom, 1)
 
         # Resize to common width and stack
         w_common = min(warped_top.shape[1], warped_bottom.shape[1])
@@ -173,7 +207,68 @@ class RealtimeSTCNTracker(Node):
         bot_resized = cv2.resize(warped_bottom, (w_common, bot_h), interpolation=cv2.INTER_LINEAR)
 
         stitched = np.vstack([top_resized, bot_resized])
+        
+        # Store metadata for mask unwarping
+        self.stitch_meta = {
+            'top': {
+                **meta_top,
+                'scale': scale_top,
+                'resized_size': (top_h, w_common),
+            },
+            'bottom': {
+                **meta_bottom,
+                'scale': scale_bottom,
+                'resized_size': (bot_h, w_common),
+            },
+            'resize_w': w_common,
+            'split_h': top_h
+        }
+        
         return stitched
+    
+    def unwarp_stitched_mask_to_original_pair(self, mask_stitched, meta):
+        """
+        Given a stitched binary mask and warp metadata, return two separate masks
+        in original camera coordinates: (mask_cam1, mask_cam0)
+        
+        Returns:
+            mask_cam1: top camera mask in original coordinates (H0, W0)
+            mask_cam0: bottom camera mask in original coordinates (H1, W1)
+        """
+        Hc, Wc = mask_stitched.shape[:2]
+        split_h = meta['split_h']
+
+        top_mask_resized = mask_stitched[:split_h, :]
+        bot_mask_resized = mask_stitched[split_h:, :]
+
+        # --- Cam1 (top/camera_01) ---
+        h0_warp, w0_warp = meta['top']['warped_size']
+        top_mask_warp = cv2.resize(
+            top_mask_resized, (w0_warp, h0_warp), interpolation=cv2.INTER_NEAREST
+        )
+
+        M0 = meta['top']['M']
+        Minv0 = np.linalg.inv(M0)
+        h0_orig, w0_orig = meta['top']['orig_size']
+        mask_cam1 = cv2.warpPerspective(
+            top_mask_warp, Minv0.astype(np.float32), (w0_orig, h0_orig), 
+            flags=cv2.INTER_NEAREST
+        )
+
+        # --- Cam0 (bottom/camera_02) ---
+        h1_warp, w1_warp = meta['bottom']['warped_size']
+        bot_mask_warp = cv2.resize(
+            bot_mask_resized, (w1_warp, h1_warp), interpolation=cv2.INTER_NEAREST
+        )
+        M1 = meta['bottom']['M']
+        Minv1 = np.linalg.inv(M1)
+        h1_orig, w1_orig = meta['bottom']['orig_size']
+        mask_cam0 = cv2.warpPerspective(
+            bot_mask_warp, Minv1.astype(np.float32), (w1_orig, h1_orig), 
+            flags=cv2.INTER_NEAREST
+        )
+
+        return mask_cam1, mask_cam0
 
     def _start_yolo_subprocess(self):
         """启动YOLO子进程"""
@@ -186,7 +281,7 @@ class RealtimeSTCNTracker(Node):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,  # Ignore stderr
                     bufsize=0,
-                    cwd='/home/oliver/Documents/STCN'
+                    cwd='/home/hanxi/code/ia_robot_sim/src/ia_perception_human_tracking'
                 )
                 # Wait for READY signal from stdout
                 import select
@@ -625,6 +720,42 @@ class RealtimeSTCNTracker(Node):
         # Visualize
         if mask is not None:
             self.visualize(frame_rgb, mask)
+            
+            # Unwarp mask to original camera coordinates and publish concatenated
+            if self.stitch_meta is not None:
+                try:
+                    mask_cam1, mask_cam0 = self.unwarp_stitched_mask_to_original_pair(
+                        mask, self.stitch_meta
+                    )
+                    
+                    # Resize masks to common width for concatenation
+                    h0, w0 = mask_cam0.shape
+                    h1, w1 = mask_cam1.shape
+                    w_common = max(w0, w1)
+                    
+                    # Resize if needed to match width
+                    if w0 != w_common:
+                        mask_cam0 = cv2.resize(mask_cam0, (w_common, h0), interpolation=cv2.INTER_NEAREST)
+                    if w1 != w_common:
+                        mask_cam1 = cv2.resize(mask_cam1, (w_common, h1), interpolation=cv2.INTER_NEAREST)
+                    
+                    # Concatenate vertically: [cam1 on top | cam0 on bottom]
+                    mask_dual = np.vstack([mask_cam1, mask_cam0])
+
+                    # print shape of mask_dual
+                    self.get_logger().info(f"Publishing concatenated mask shape: {mask_dual.shape}")
+                    
+                    # Publish concatenated mask with sim time from source images
+                    mask_dual_msg = self.bridge.cv2_to_imgmsg(mask_dual, encoding='mono8')
+                    if self.last_timestamp is not None:
+                        mask_dual_msg.header.stamp = self.last_timestamp
+                    else:
+                        mask_dual_msg.header.stamp = self.get_clock().now().to_msg()
+                    mask_dual_msg.header.frame_id = 'dual_camera'
+                    self.mask_concatenated_publisher.publish(mask_dual_msg)
+                    
+                except Exception as e:
+                    self.get_logger().error(f"Failed to unwarp/publish masks: {e}")
 
         self.current_frame_idx += 1
 
