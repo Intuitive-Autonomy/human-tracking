@@ -8,14 +8,14 @@ echo "=== human-tracking Test Runner ==="
 TEST_TYPE="${1:-smoke}"
 echo "Test type: $TEST_TYPE"
 
-# Install dependencies
+# Install dependencies (user mode to avoid permission issues in Docker)
 if [ -f "requirements.txt" ]; then
     echo "Installing dependencies..."
-    pip install -r requirements.txt --quiet
+    pip install --user -r requirements.txt --quiet || pip install -r requirements.txt --quiet
 fi
 
 # Install test dependencies
-pip install pytest pytest-cov --quiet
+pip install --user pytest pytest-cov --quiet || pip install pytest pytest-cov --quiet
 
 # Check if tests directory exists
 if [ ! -d "tests" ]; then
