@@ -27,7 +27,6 @@ import torch
 import torch.nn.functional as F
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
-from collections import deque
 import threading
 import subprocess
 import pickle
@@ -68,9 +67,10 @@ class RealtimeSTCNTracker(Node):
         self.tracking_initialized = False
         self.first_mask = None
         self.processor = None
-        self.frame_buffer = deque(maxlen=self.max_memory_frames)
         self.current_frame_idx = 0
         self.mask_frame_idx = -1
+        # Store frame data when mask is detected
+        self.mask_frame_data = None
 
         # Transform for STCN
         self.im_transform = transforms.Compose([
@@ -395,7 +395,10 @@ class RealtimeSTCNTracker(Node):
             self.mem_banks[oi] = bank
 
         # Encode first frame with mask
-        frame_tensor = self.frame_buffer[self.mask_frame_idx]['tensor']
+        if self.mask_frame_data is None:
+            raise RuntimeError("mask_frame_data is None - cannot initialize tracking")
+        
+        frame_tensor = self.mask_frame_data['tensor']
         frame_cuda = frame_tensor.unsqueeze(0).unsqueeze(0).cuda()  # (1, 1, C, H, W)
 
         # Pad frame
@@ -585,19 +588,6 @@ class RealtimeSTCNTracker(Node):
         # Convert to tensor
         frame_tensor, frame_rgb = self.frame_to_tensor(stitched_bgr)
 
-        # Store frame in buffer (only needed before tracking initialization)
-        if not self.tracking_initialized:
-            self.frame_buffer.append({
-                'tensor': frame_tensor,
-                'rgb': frame_rgb,
-                'bgr': stitched_bgr,
-                'size': orig_size
-            })
-        # After tracking starts, clear buffer to save memory
-        elif len(self.frame_buffer) > 0:
-            self.frame_buffer.clear()
-            self.get_logger().info("Frame buffer cleared after tracking initialization")
-
         mask = None
 
         if not self.tracking_initialized:
@@ -610,6 +600,14 @@ class RealtimeSTCNTracker(Node):
                 self.get_logger().info(f"✓ Found first mask at frame {self.current_frame_idx} ({num_det} detections)")
                 self.first_mask = mask
                 self.mask_frame_idx = self.current_frame_idx
+                
+                # Store current frame data for initialization
+                self.mask_frame_data = {
+                    'tensor': frame_tensor,
+                    'rgb': frame_rgb,
+                    'bgr': stitched_bgr,
+                    'size': orig_size
+                }
 
                 # Initialize tracking
                 try:
@@ -656,21 +654,18 @@ class RealtimeSTCNTracker(Node):
                         self.mem_banks[oi] = bank
 
                     # Re-initialize tracking with new mask
-                    # Clear buffer and add current frame at index 0
-                    self.frame_buffer.clear()
-                    self.frame_buffer.append({
+                    # Store current frame data for re-initialization
+                    self.mask_frame_data = {
                         'tensor': frame_tensor,
                         'rgb': frame_rgb,
                         'bgr': stitched_bgr,
                         'size': orig_size
-                    })
-                    self.mask_frame_idx = 0  # Frame is at index 0 in buffer
+                    }
+                    self.mask_frame_idx = self.current_frame_idx
 
                     try:
                         self.initialize_tracking(new_mask, orig_size)
                         mask = new_mask
-                        self.frame_buffer.clear()  # Clear after re-init
-                        self.mask_frame_idx = self.current_frame_idx  # Reset to actual frame number
                         self.get_logger().info(f"✓ Tracking re-initialized successfully")
                     except Exception as e:
                         self.get_logger().error(f"Failed to re-initialize tracking: {e}")
@@ -743,7 +738,7 @@ class RealtimeSTCNTracker(Node):
                     mask_dual = np.vstack([mask_cam1, mask_cam0])
 
                     # print shape of mask_dual
-                    self.get_logger().info(f"Publishing concatenated mask shape: {mask_dual.shape}")
+                    # self.get_logger().info(f"Publishing concatenated mask shape: {mask_dual.shape}")
                     
                     # Publish concatenated mask with sim time from source images
                     mask_dual_msg = self.bridge.cv2_to_imgmsg(mask_dual, encoding='mono8')
