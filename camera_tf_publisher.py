@@ -28,18 +28,18 @@ def publish_camera_tfs():
     # Camera 1: -30 deg pitch rotation + global offset, overall height + relative -1.5cm offset
     pitch_cam1 = math.radians(-30) + global_pitch_offset  # -30 - 15 = -45 degrees total
     quat_cam1 = tf_trans.quaternion_from_euler(0, pitch_cam1, 0)  # roll, pitch, yaw
-    trans_cam1 = (0.0, 0.0, base_height - 0.015)  # 70cm - 1.5cm = 95.0cm
+    trans_cam1 = (0.0, 0.0, base_height - 0.015)
 
     # Camera 2: +30 deg pitch rotation + global offset, overall height + relative +1.5cm offset
     pitch_cam2 = math.radians(30) + global_pitch_offset  # +30 - 15 = +15 degrees total
     quat_cam2 = tf_trans.quaternion_from_euler(0, pitch_cam2, 0)  # roll, pitch, yaw
-    trans_cam2 = (0.0, 0.0, base_height + 0.015)  # 70cm + 1.5cm = 98.0cm
+    trans_cam2 = (0.0, 0.0, base_height + 0.015)
 
     rospy.loginfo("Publishing camera TF transforms...")
     rospy.loginfo("Global pitch offset: -15deg")
     rospy.loginfo("Base height: %.2fm (70cm)" % base_height)
-    rospy.loginfo("Camera 1: pitch=-45deg (=-30-15), z=%.3fm (95.0cm, lower, tilted down)" % trans_cam1[2])
-    rospy.loginfo("Camera 2: pitch=+15deg (=+30-15), z=%.3fm (98.0cm, higher, tilted up)" % trans_cam2[2])
+    rospy.loginfo("Camera 1: pitch=-45deg, z=%.3fm" % trans_cam1[2])
+    rospy.loginfo("Camera 2: pitch=+15deg, z=%.3fm" % trans_cam2[2])
 
     while not rospy.is_shutdown():
         current_time = rospy.Time.now()
