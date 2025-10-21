@@ -49,7 +49,7 @@ class RealtimeSTCNTracker(object):
         rospy.init_node('realtime_stcn_tracker', anonymous=True)
 
         # Configuration - Optimized for Jetson
-        self.conf_threshold = 0.3
+        self.conf_threshold = 0.2
         self.resolution = 480  # Reduced from 720 for faster inference on Jetson
         self.angle_degrees = 25
         self.input_scale = 0.5  # Downsample 1280x720 -> 640x360 before stitching
@@ -61,6 +61,12 @@ class RealtimeSTCNTracker(object):
         self.min_mask_area = 500  # Minimum pixels for valid tracking
         self.tracking_lost_threshold = 3  # Consecutive frames with poor tracking
         self.poor_tracking_count = 0  # Counter for poor tracking frames
+
+        # Improved tracking: mask history and quality tracking
+        self.last_valid_mask = None  # Fallback mask for failed frames
+        self.last_valid_mask_area = 0
+        self.mask_quality_history = deque(maxlen=10)  # Track last 10 frames' quality
+        self.mask_area_history = deque(maxlen=10)  # Track mask area history for trend detection
 
         # State
         self.bridge = CvBridge()
@@ -434,6 +440,10 @@ class RealtimeSTCNTracker(object):
         self.last_mem_ti = self.mask_frame_idx
         self.tracking_initialized = True
 
+        # Record first mask as valid fallback
+        self.last_valid_mask = first_mask.copy()
+        self.last_valid_mask_area = np.count_nonzero(first_mask)
+
     def track_frame(self, frame_tensor, orig_size):
         """Track single frame using STCN"""
         start_time = time.time()
@@ -473,34 +483,41 @@ class RealtimeSTCNTracker(object):
             is_mem_frame = (abs(self.current_frame_idx - self.last_mem_ti) >= self.mem_every)
 
             if is_mem_frame:
-                # Encode value and add to memory
-                prev_value = self.stcn_model.encode_value(frame_cuda[:,0], qf16, out_mask[1:])
-                prev_key = k16.unsqueeze(2)
+                # Improved: Only add to memory if tracking quality is good
+                # This prevents pollution from poor tracking frames
+                mask_area = torch.sum(out_mask[1:]).item()  # Sum all object channels
 
-                for i in range(self.num_objects):
-                    bank = self.mem_banks[i+1]
+                # Only add to memory if mask area is reasonable
+                # Avoid adding frames where tracking drifted or is very uncertain
+                if mask_area > self.min_mask_area * 0.7:  # Allow 70% of threshold
+                    # Encode value and add to memory
+                    prev_value = self.stcn_model.encode_value(frame_cuda[:,0], qf16, out_mask[1:])
+                    prev_key = k16.unsqueeze(2)
 
-                    # Limit memory bank size to prevent OOM
-                    if bank.mem_k is not None:
-                        # mem_k shape: (1, C, T*H*W), we track number of frames
-                        chunk_size = prev_key.flatten(start_dim=2).shape[2]
-                        current_frames = bank.mem_k.shape[2] // chunk_size
+                    for i in range(self.num_objects):
+                        bank = self.mem_banks[i+1]
 
-                        if current_frames >= self.max_memory_frames:
-                            # Remove oldest frames - use .contiguous() and explicitly delete old tensors
-                            old_k = bank.mem_k
-                            old_v = bank.mem_v
+                        # Limit memory bank size to prevent OOM
+                        if bank.mem_k is not None:
+                            # mem_k shape: (1, C, T*H*W), we track number of frames
+                            chunk_size = prev_key.flatten(start_dim=2).shape[2]
+                            current_frames = bank.mem_k.shape[2] // chunk_size
 
-                            # Keep only recent frames, create contiguous tensor
-                            bank.mem_k = bank.mem_k[:, :, chunk_size:].contiguous()
-                            bank.mem_v = bank.mem_v[:, :, chunk_size:].contiguous()
+                            if current_frames >= self.max_memory_frames:
+                                # Remove oldest frames - use .contiguous() and explicitly delete old tensors
+                                old_k = bank.mem_k
+                                old_v = bank.mem_v
 
-                            # Explicitly delete old tensors to free memory
-                            del old_k, old_v
+                                # Keep only recent frames, create contiguous tensor
+                                bank.mem_k = bank.mem_k[:, :, chunk_size:].contiguous()
+                                bank.mem_v = bank.mem_v[:, :, chunk_size:].contiguous()
 
-                    bank.add_memory(prev_key, prev_value[i:i+1])
+                                # Explicitly delete old tensors to free memory
+                                del old_k, old_v
 
-                self.last_mem_ti = self.current_frame_idx
+                        bank.add_memory(prev_key, prev_value[i:i+1])
+
+                    self.last_mem_ti = self.current_frame_idx
 
         # Get final mask (foreground only, sum all object channels)
         # out_mask shape: (k+1, 1, H, W), we want objects only (index 1 onwards)
@@ -537,19 +554,197 @@ class RealtimeSTCNTracker(object):
 
         return mask, tracking_time
 
-    def is_tracking_lost(self, mask):
-        """Check if tracking quality is too poor (target lost)"""
-        if mask is None:
-            return True
+    def check_yolo_mask_coverage(self, tracking_mask, yolo_mask, threshold=0.8):
+        """
+        Check if tracking_mask is mostly contained in yolo_mask
 
-        # Calculate mask area (number of non-zero pixels)
+        Args:
+            tracking_mask: Current STCN tracking mask
+            yolo_mask: YOLO detection mask
+            threshold: Percentage threshold (default 80%)
+
+        Returns:
+            (is_covered, coverage_ratio)
+        """
+        if tracking_mask is None or yolo_mask is None:
+            return False, 0.0
+
+        # Convert to binary
+        track_bin = (tracking_mask > 128).astype(np.uint8)
+        yolo_bin = (yolo_mask > 128).astype(np.uint8)
+
+        track_pixels = np.count_nonzero(track_bin)
+        if track_pixels == 0:
+            return False, 0.0
+
+        # Count overlap: tracking pixels that are in YOLO mask
+        overlap = np.count_nonzero(track_bin & yolo_bin)
+        coverage_ratio = overlap / track_pixels
+
+        is_covered = coverage_ratio >= threshold
+        return is_covered, coverage_ratio
+
+    def compute_mask_increment(self, tracking_mask, yolo_mask):
+        """
+        Compute mask increment: YOLO mask - tracking mask
+        Returns pixels in YOLO mask but not in tracking mask
+
+        Args:
+            tracking_mask: Current STCN tracking mask
+            yolo_mask: YOLO detection mask
+
+        Returns:
+            increment_mask: Mask containing only new pixels from YOLO
+        """
+        track_bin = (tracking_mask > 128).astype(np.uint8)
+        yolo_bin = (yolo_mask > 128).astype(np.uint8)
+
+        # Increment = YOLO - tracking (pixels in YOLO but not in tracking)
+        increment = (yolo_bin & ~track_bin).astype(np.uint8) * 255
+
+        return increment
+
+    def update_memory_bank_with_increment(self, frame_tensor, increment_mask, orig_size):
+        """
+        Update memory bank using mask increment instead of full re-initialization
+        This adds new information to memory without disrupting existing tracking
+
+        Args:
+            frame_tensor: Frame tensor for encoding
+            increment_mask: Mask increment (new pixels from YOLO)
+            orig_size: Original image size
+        """
+        try:
+            if increment_mask is None:
+                return
+
+            increment_pixels = np.count_nonzero(increment_mask > 128)
+            if increment_pixels < 100:  # Too small to be meaningful
+                rospy.logwarn("Increment mask too small (%d pixels), skipping" % increment_pixels)
+                return
+
+            # Prepare frame for encoding
+            frame_cuda = frame_tensor.unsqueeze(0).unsqueeze(0).cuda()
+
+            # Pad frame
+            from util.tensor_util import pad_divide_by
+            frame_cuda, pad = pad_divide_by(frame_cuda, 16)
+
+            # Get spatial size after padding
+            Hp, Wp = frame_cuda.shape[-2:]
+
+            # Resize increment mask to match frame size
+            mask_resized = cv2.resize(increment_mask, (Wp, Hp), interpolation=cv2.INTER_NEAREST)
+            mask_binary = (mask_resized > 128).astype(np.uint8)
+
+            # Create onehot format
+            mask_onehot = all_to_onehot(mask_binary, np.array([1]))
+            mask_tensor = torch.from_numpy(mask_onehot).float().cuda()
+
+            if len(mask_tensor.shape) == 2:
+                mask_tensor = mask_tensor.unsqueeze(0)
+            elif len(mask_tensor.shape) == 4:
+                mask_tensor = mask_tensor.squeeze(1)
+
+            # Resize to padded size
+            mask_tensor_resized = transforms.Resize(
+                (Hp, Wp), interpolation=InterpolationMode.NEAREST
+            )(mask_tensor)
+
+            if len(mask_tensor_resized.shape) == 2:
+                mask_tensor_resized = mask_tensor_resized.unsqueeze(0).unsqueeze(1)
+            elif len(mask_tensor_resized.shape) == 3:
+                mask_tensor_resized = mask_tensor_resized.unsqueeze(1)
+
+            with_bg_msk = torch.cat([1 - torch.sum(mask_tensor_resized, dim=0, keepdim=True), mask_tensor_resized], 0)
+
+            # Encode new key and value
+            with torch.amp.autocast('cuda', enabled=True):
+                key_k, _, qf16, _, _ = self.stcn_model.encode_key(frame_cuda[:,0])
+                key_v = self.stcn_model.encode_value(frame_cuda[:,0], qf16, with_bg_msk[1:])
+                key_k = key_k.unsqueeze(2)
+
+                # Add to memory banks
+                for i in range(self.num_objects):
+                    bank = self.mem_banks[i+1]
+
+                    # Limit memory bank size
+                    if bank.mem_k is not None:
+                        chunk_size = key_k.flatten(start_dim=2).shape[2]
+                        current_frames = bank.mem_k.shape[2] // chunk_size
+
+                        if current_frames >= self.max_memory_frames:
+                            old_k = bank.mem_k
+                            old_v = bank.mem_v
+                            bank.mem_k = bank.mem_k[:, :, chunk_size:].contiguous()
+                            bank.mem_v = bank.mem_v[:, :, chunk_size:].contiguous()
+                            del old_k, old_v
+
+                    bank.add_memory(key_k, key_v[i:i+1])
+
+            rospy.loginfo("[Memory Increment Update] Frame %d: Added %d pixels to memory" %
+                         (self.current_frame_idx, increment_pixels))
+
+        except Exception as e:
+            rospy.logerr("Failed to update memory with increment: %s" % str(e))
+            import traceback
+            rospy.logerr(traceback.format_exc())
+
+    def is_tracking_lost(self, mask):
+        """
+        Improved tracking loss detection with multi-dimensional quality checks
+        Returns: (is_lost, quality_score, diagnosis)
+        """
+        diagnosis = {
+            'null_mask': False,
+            'area_too_small': False,
+            'area_shrinking': False,
+            'low_quality': False
+        }
+        quality_score = 1.0
+
+        if mask is None:
+            diagnosis['null_mask'] = True
+            self.mask_quality_history.append(0.0)
+            self.mask_area_history.append(0)
+            return True, 0.0, diagnosis
+
+        # Calculate mask area
         mask_area = np.count_nonzero(mask)
 
-        # Check if mask area is below threshold
+        # 1. Check absolute area threshold
         if mask_area < self.min_mask_area:
-            return True
+            diagnosis['area_too_small'] = True
+            quality_score *= 0.3
 
-        return False
+        # 2. Check if area is rapidly shrinking (sign of tracking drift)
+        if len(self.mask_area_history) >= 3:
+            recent_areas = list(self.mask_area_history)[-3:]
+            avg_recent = np.mean(recent_areas)
+            shrink_rate = (self.last_valid_mask_area - mask_area) / (self.last_valid_mask_area + 1e-6)
+
+            # If area drops by >50% in one frame, likely tracking lost
+            if shrink_rate > 0.5 and mask_area < self.min_mask_area * 2:
+                diagnosis['area_shrinking'] = True
+                quality_score *= 0.4
+
+        # 3. Check quality trend
+        if len(self.mask_quality_history) >= 3:
+            recent_quality = list(self.mask_quality_history)[-3:]
+            avg_quality = np.mean(recent_quality)
+            # If consistently low quality, mark as lost
+            if avg_quality < 0.5:
+                diagnosis['low_quality'] = True
+                quality_score *= 0.5
+
+        # Record this frame's quality
+        self.mask_quality_history.append(quality_score)
+        self.mask_area_history.append(mask_area)
+
+        # Consider lost if quality score below threshold or area too small
+        is_lost = quality_score < 0.4 or mask_area < self.min_mask_area
+
+        return is_lost, quality_score, diagnosis
 
     def depth_to_pointcloud(self, depth_image, mask, camera_frame, intrinsics, timestamp, max_points=None):
         """Convert depth image and mask to pointcloud with correct intrinsics and coordinate transform"""
@@ -787,64 +982,120 @@ class RealtimeSTCNTracker(object):
                 rospy.logerr("Traceback: %s" % traceback.format_exc())
                 mask = None
 
-            # Check tracking quality - Only run YOLO when target is lost
-            if self.is_tracking_lost(mask):
+            # Improved: Check tracking quality with detailed diagnosis
+            is_lost, quality_score, diagnosis = self.is_tracking_lost(mask)
+
+            if is_lost:
                 self.poor_tracking_count += 1
-                rospy.logwarn("Poor tracking quality detected (%d/%d)" % (self.poor_tracking_count, self.tracking_lost_threshold))
+                diag_str = ", ".join([k for k, v in diagnosis.items() if v])
+                rospy.logwarn("Poor tracking detected [%s] - Quality: %.2f - Frame %d (%d/%d)" %
+                            (diag_str, quality_score, self.current_frame_idx,
+                             self.poor_tracking_count, self.tracking_lost_threshold))
+
+                # Improved: Use fallback mask strategy first
+                if self.last_valid_mask is not None and quality_score > 0.2:
+                    # If tracking is slightly degraded but not completely lost,
+                    # use the last valid mask instead of empty mask
+                    rospy.loginfo("Using fallback mask from frame %d (area: %d pixels)" %
+                                (self.current_frame_idx - 1, self.last_valid_mask_area))
+                    mask = self.last_valid_mask.copy()
+                    # Don't increment poor_tracking_count if we recovered with fallback
+                    self.poor_tracking_count = max(0, self.poor_tracking_count - 1)
 
                 # Only run YOLO if consistently lost for multiple frames
                 if self.poor_tracking_count >= self.tracking_lost_threshold:
-                    rospy.logwarn("Tracking lost! Running YOLO to re-detect...")
+                    rospy.logwarn("Tracking consistently lost! Running YOLO to re-detect...")
                     new_mask, num_det, detect_time = self.extract_mask_keep_middle(stitched_bgr)
 
                     if new_mask is not None:
                         rospy.loginfo("[YOLO Re-detect] Frame %d: %.3f ms (%d detections)" % (self.current_frame_idx, detect_time * 1000, num_det))
-                        # Reset tracking with new mask
-                        try:
-                            # Clear old memory banks
-                            for bank in self.mem_banks.values():
-                                if bank.mem_k is not None:
-                                    del bank.mem_k, bank.mem_v
-                                    bank.mem_k = None
-                                    bank.mem_v = None
-                            torch.cuda.empty_cache()
 
-                            # Recreate memory banks
-                            from inference_memory_bank import MemoryBank
-                            self.mem_banks = {}
-                            for oi in range(1, self.num_objects + 1):
-                                bank = MemoryBank(k=1, top_k=self.top_k)
-                                bank.temp_k = None
-                                bank.temp_v = None
-                                self.mem_banks[oi] = bank
+                        # ==== New logic: Compare YOLO mask with current tracking mask ====
+                        # Get current tracking mask for comparison
+                        current_tracking_mask = mask if mask is not None else None
 
-                            # Re-initialize tracking
-                            self.frame_buffer.clear()
-                            self.frame_buffer.append({
-                                'tensor': frame_tensor,
-                                'rgb': frame_rgb,
-                                'bgr': stitched_bgr,
-                                'size': orig_size
-                            })
-                            self.mask_frame_idx = 0
-                            self.initialize_tracking(new_mask, orig_size)
+                        # Check coverage
+                        is_covered, coverage_ratio = self.check_yolo_mask_coverage(
+                            current_tracking_mask, new_mask, threshold=0.8
+                        )
+
+                        rospy.loginfo("[YOLO-Tracking Compare] Coverage: %.1f%% (80%% threshold)" %
+                                     (coverage_ratio * 100))
+
+                        if is_covered:
+                            # Tracking mask is 80%+ in YOLO mask
+                            # Use increment update instead of full re-initialization
+                            rospy.loginfo("[YOLO Update Strategy] Using increment update (coverage: %.1f%%)" %
+                                         (coverage_ratio * 100))
+
+                            # Compute increment mask (new pixels from YOLO)
+                            increment_mask = self.compute_mask_increment(current_tracking_mask, new_mask)
+
+                            # Update memory bank with increment
+                            self.update_memory_bank_with_increment(frame_tensor, increment_mask, orig_size)
+
+                            # Update mask to be the merged one (YOLO provides new information)
                             mask = new_mask
-                            self.frame_buffer.clear()
-                            self.mask_frame_idx = self.current_frame_idx
                             self.poor_tracking_count = 0  # Reset counter
-                            rospy.loginfo("Tracking re-initialized successfully")
-                        except Exception as e:
-                            rospy.logerr("Failed to re-initialize tracking: %s" % str(e))
-                            mask = np.zeros(orig_size, dtype=np.uint8)
+
+                        else:
+                            # Tracking mask is not well-covered by YOLO mask
+                            # This means tracking drifted significantly, need full re-initialization
+                            rospy.loginfo("[YOLO Update Strategy] Using full re-initialization (coverage: %.1f%%)" %
+                                         (coverage_ratio * 100))
+
+                            try:
+                                # Clear old memory banks
+                                for bank in self.mem_banks.values():
+                                    if bank.mem_k is not None:
+                                        del bank.mem_k, bank.mem_v
+                                        bank.mem_k = None
+                                        bank.mem_v = None
+                                torch.cuda.empty_cache()
+
+                                # Recreate memory banks
+                                from inference_memory_bank import MemoryBank
+                                self.mem_banks = {}
+                                for oi in range(1, self.num_objects + 1):
+                                    bank = MemoryBank(k=1, top_k=self.top_k)
+                                    bank.temp_k = None
+                                    bank.temp_v = None
+                                    self.mem_banks[oi] = bank
+
+                                # Re-initialize tracking
+                                self.frame_buffer.clear()
+                                self.frame_buffer.append({
+                                    'tensor': frame_tensor,
+                                    'rgb': frame_rgb,
+                                    'bgr': stitched_bgr,
+                                    'size': orig_size
+                                })
+                                self.mask_frame_idx = 0
+                                self.initialize_tracking(new_mask, orig_size)
+                                mask = new_mask
+                                self.frame_buffer.clear()
+                                self.mask_frame_idx = self.current_frame_idx
+                                self.poor_tracking_count = 0  # Reset counter
+                                rospy.loginfo("Tracking re-initialized successfully")
+                            except Exception as e:
+                                rospy.logerr("Failed to re-initialize tracking: %s" % str(e))
+                                mask = np.zeros(orig_size, dtype=np.uint8)
                     else:
-                        rospy.logwarn("YOLO re-detection failed, using empty mask")
-                        mask = np.zeros(orig_size, dtype=np.uint8)
-                else:
-                    # Still tracking poorly but not threshold yet, use empty mask
+                        rospy.logwarn("YOLO re-detection failed, using fallback mask")
+                        if self.last_valid_mask is not None:
+                            mask = self.last_valid_mask.copy()
+                        else:
+                            mask = np.zeros(orig_size, dtype=np.uint8)
+                elif self.last_valid_mask is None:
+                    # First poor frame and no fallback available, use empty
                     mask = np.zeros(orig_size, dtype=np.uint8)
             else:
-                # Tracking is good, reset counter
+                # Tracking is good, reset counter and save as valid mask
                 self.poor_tracking_count = 0
+                mask_area = np.count_nonzero(mask) if mask is not None else 0
+                if mask_area >= self.min_mask_area:
+                    self.last_valid_mask = mask.copy()
+                    self.last_valid_mask_area = mask_area
 
         # Publish pointclouds for each camera
         if mask is not None:

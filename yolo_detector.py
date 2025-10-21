@@ -30,9 +30,9 @@ class YOLODetector:
         h, w = frame_bgr.shape[:2]
         cx_mid = w * 0.5
 
-        # Downsample to 512 width for faster YOLO processing
-        # Input is already 640x360 from main tracker, downsample to ~512x288
-        target_w = 512
+        # Downsample to 320x360 for faster YOLO processing
+        # Input is 640x720 from main tracker, downsample to 320x360 (50% reduction)
+        target_w = 320
         scale = target_w / w
         ds_h = int(h * scale)
         ds_w = target_w
@@ -40,7 +40,6 @@ class YOLODetector:
         frame_ds = cv2.resize(frame_bgr, (ds_w, ds_h), interpolation=cv2.INTER_AREA)
 
         # Use FP16 and optimized parameters for faster inference on Jetson
-        # Note: First run may take longer due to CUDA initialization
         results = self.model.predict(
             frame_ds[..., ::-1],
             classes=[0],           # Person class only
@@ -48,7 +47,7 @@ class YOLODetector:
             verbose=False,
             device="cuda",
             half=True,             # FP16 for ~2x speedup on Jetson
-            imgsz=512,             # Match downsampled size
+            imgsz=320,             # Match downsampled size
             max_det=10             # Limit max detections for speed
         )
 
