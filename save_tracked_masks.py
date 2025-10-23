@@ -37,6 +37,7 @@ from dataset.util import all_to_onehot
 # ----------------- Config -----------------
 CONF = 0.3  # YOLO confidence threshold
 SAVE_ROOT = "masks"  # 保存根目录，每个 session 一个子目录
+BATCH_SIZE = 200  # 每批处理的帧数，防止内存溢出
 
 # ----------------- Load models -----------------
 print("Loading YOLO segmentation model...")
@@ -396,11 +397,11 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
-def run_all_sessions_and_save(csv_file, recordings_dir, save_root=SAVE_ROOT):
+def run_all_sessions_and_save(csv_file, recordings_dir, save_root=SAVE_ROOT, batch_size=BATCH_SIZE):
     """
     For each session in CSV:
       - find first keep_middle mask frame
-      - run STCN for the whole session
+      - run STCN in batches to avoid memory overflow
       - for each frame: unwarp mask back to original camera planes and save as masks/<session>/<frame_id>.png
     """
     # Read CSV
@@ -438,41 +439,86 @@ def run_all_sessions_and_save(csv_file, recordings_dir, save_root=SAVE_ROOT):
             print("!! No valid initial mask in this session. Skipping...")
             continue
 
-        # Step 2: Prepare frames + metas (for unwarp later)
-        print("\nStep 2: Loading and preparing all frames...")
-        frames, orig_size, stitch_metas, _ = prepare_stcn_frames(session_frames, base_path)
-        print(f"Loaded {frames.shape[1]} frames, tensor shape: {frames.shape}, orig_size={orig_size}")
-
-        # Step 3: STCN
-        print("\nStep 3: Running STCN tracking (start index = mask_frame_idx)...")
-        processor = setup_stcn_tracking(frames, first_mask, mask_frame_idx)
-
-        # Step 4: Collect masks (stitched space)
-        print("\nStep 4: Extracting all masks...")
-        all_masks = extract_all_masks(processor, orig_size)
-        print(f"Extracted {len(all_masks)} masks")
-
-        # Step 5: Save masks per frame (unwarp -> save)
+        # Create session save directory
         session_save_dir = save_root_path / session_id
         ensure_dir(session_save_dir)
 
-        print("\nStep 5: Saving unwarped masks...")
-        for frame_idx, row in enumerate(session_frames):
-            # stitched-space mask for this frame
-            m_stitched = all_masks[frame_idx]
+        # 分批处理以避免内存溢出
+        total_frames = len(session_frames)
+        num_batches = (total_frames + batch_size - 1) // batch_size
+        print(f"\nProcessing {total_frames} frames in {num_batches} batch(es) of up to {batch_size} frames each...")
 
-            # unwarp back to original camera planes and vertically stack to common width
-            meta = stitch_metas[frame_idx]
-            m_unwarped = unwarp_stitched_mask_to_original_pair(m_stitched, meta)  # uint8 0/255
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, total_frames)
+            batch_frames = session_frames[start_idx:end_idx]
 
-            # filename by frame_id from CSV (fallback to index if missing)
-            frame_id = row.get('frame_id', None)
-            if frame_id is None or len(str(frame_id)) == 0:
-                frame_id = str(frame_idx).zfill(6)
+            print(f"\n--- Batch {batch_idx + 1}/{num_batches}: frames {start_idx}-{end_idx-1} ---")
 
-            out_path = session_save_dir / f"{frame_id}.png"
-            cv2.imwrite(str(out_path), m_unwarped)
-        print(f"✓ Saved masks to: {session_save_dir}")
+            # Step 2: Prepare frames + metas (for unwarp later)
+            print(f"Loading {len(batch_frames)} frames...")
+            frames, orig_size, stitch_metas, _ = prepare_stcn_frames(batch_frames, base_path)
+            print(f"Loaded {frames.shape[1]} frames, tensor shape: {frames.shape}, orig_size={orig_size}")
+
+            # Adjust mask_frame_idx for this batch
+            batch_mask_idx = mask_frame_idx - start_idx
+            if batch_mask_idx < 0:
+                # 初始 mask 在之前的 batch 中，使用第一帧
+                batch_mask_idx = 0
+            elif batch_mask_idx >= len(batch_frames):
+                # 初始 mask 在之后的 batch 中，使用第一帧
+                batch_mask_idx = 0
+
+            # 如果是第一个 batch 且包含初始 mask，使用原始 first_mask
+            # 否则从第一帧重新提取 mask（或从上一批次的最后一帧继续）
+            if batch_idx == 0 and mask_frame_idx >= start_idx and mask_frame_idx < end_idx:
+                current_mask = first_mask
+                current_mask_idx = batch_mask_idx
+            else:
+                # 从当前 batch 的第一帧重新提取 mask
+                img0 = cv2.imread(str(base_path / batch_frames[0]['camera_0_rgb_filename']))
+                img1 = cv2.imread(str(base_path / batch_frames[0]['camera_1_rgb_filename']))
+                stitched_bgr, _ = stitch_images_with_meta(img0, img1)
+                current_mask, _ = extract_mask_from_frame_keep_middle(stitched_bgr)
+                if current_mask is None:
+                    print(f"⚠ Warning: Could not extract mask for batch {batch_idx + 1}, skipping...")
+                    continue
+                current_mask_idx = 0
+
+            # Step 3: STCN
+            print(f"Running STCN tracking (start index = {current_mask_idx})...")
+            processor = setup_stcn_tracking(frames, current_mask, current_mask_idx)
+
+            # Step 4: Collect masks (stitched space)
+            print("Extracting masks...")
+            all_masks = extract_all_masks(processor, orig_size)
+            print(f"Extracted {len(all_masks)} masks")
+
+            # Step 5: Save masks per frame (unwarp -> save)
+            print("Saving unwarped masks...")
+            for local_idx, row in enumerate(batch_frames):
+                # stitched-space mask for this frame
+                m_stitched = all_masks[local_idx]
+
+                # unwarp back to original camera planes and vertically stack to common width
+                meta = stitch_metas[local_idx]
+                m_unwarped = unwarp_stitched_mask_to_original_pair(m_stitched, meta)  # uint8 0/255
+
+                # filename by frame_id from CSV (fallback to index if missing)
+                frame_id = row.get('frame_id', None)
+                if frame_id is None or len(str(frame_id)) == 0:
+                    frame_id = str(start_idx + local_idx).zfill(6)
+
+                out_path = session_save_dir / f"{frame_id}.png"
+                cv2.imwrite(str(out_path), m_unwarped)
+
+            print(f"✓ Batch {batch_idx + 1}/{num_batches} saved")
+
+            # 清理内存
+            del frames, processor, all_masks, stitch_metas
+            torch.cuda.empty_cache()
+
+        print(f"\n✓ Session complete. All masks saved to: {session_save_dir}")
 
     print("\nAll sessions processed. Done!")
 
@@ -589,6 +635,7 @@ if __name__ == "__main__":
     parser.add_argument("--csv", default=None, help="Path to CSV file (default: ../camera_matches_{subject}.csv)")
     parser.add_argument("--recordings", default=None, help="Path to recordings directory (default: ../recordings_{subject})")
     parser.add_argument("--save_root", default=None, help="Where to save masks (default: ../masks_{subject})")
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE, help=f"Number of frames per batch (default: {BATCH_SIZE})")
     parser.add_argument("--viz_one", default=None, help="Optional: visualize one session id instead of batch saving")
 
     args = parser.parse_args()
@@ -603,4 +650,4 @@ if __name__ == "__main__":
     if args.viz_one is not None:
         play_stcn_tracking(csv_file, recordings_dir, args.viz_one)
     else:
-        run_all_sessions_and_save(csv_file, recordings_dir, save_root)
+        run_all_sessions_and_save(csv_file, recordings_dir, save_root, args.batch_size)
