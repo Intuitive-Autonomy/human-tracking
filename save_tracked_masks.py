@@ -585,14 +585,22 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Batch STCN tracking on ALL sessions and save unwarped masks")
-    parser.add_argument("--csv", default="/media/oliver/8068753A68752FD0/0929/camera_matches.csv", help="Path to CSV file")
-    parser.add_argument("--recordings", default="/media/oliver/8068753A68752FD0/0929/recordings", help="Path to recordings directory")
-    parser.add_argument("--save_root", default=SAVE_ROOT, help="Where to save masks/<session>/<frame_id>.png")
+    parser.add_argument("--subject", type=str, default='', help="Subject name for path formatting (e.g., recordings_{subject})")
+    parser.add_argument("--csv", default=None, help="Path to CSV file (default: ../camera_matches_{subject}.csv)")
+    parser.add_argument("--recordings", default=None, help="Path to recordings directory (default: ../recordings_{subject})")
+    parser.add_argument("--save_root", default=None, help="Where to save masks (default: ../masks_{subject})")
     parser.add_argument("--viz_one", default=None, help="Optional: visualize one session id instead of batch saving")
 
     args = parser.parse_args()
 
+    # Build paths with subject suffix (in parent directory)
+    subject_suffix = f"_{args.subject}" if args.subject else ""
+
+    csv_file = args.csv if args.csv else f"../camera_matches{subject_suffix}.csv"
+    recordings_dir = args.recordings if args.recordings else f"../recordings{subject_suffix}"
+    save_root = args.save_root if args.save_root else f"../masks{subject_suffix}"
+
     if args.viz_one is not None:
-        play_stcn_tracking(args.csv, args.recordings, args.viz_one)
+        play_stcn_tracking(csv_file, recordings_dir, args.viz_one)
     else:
-        run_all_sessions_and_save(args.csv, args.recordings, args.save_root)
+        run_all_sessions_and_save(csv_file, recordings_dir, save_root)
