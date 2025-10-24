@@ -62,25 +62,11 @@ class RealtimeSTCNTracker(object):
         self.tracking_lost_threshold = 3  # Consecutive frames with poor tracking
         self.poor_tracking_count = 0  # Counter for poor tracking frames
 
-        # Periodic YOLO execution for mask refinement
-        self.yolo_period_frames = 60  # Run YOLO every 60 frames (~2 seconds at 30fps)
-        self.last_yolo_frame = -1000  # Last frame where YOLO was run
-
         # Improved tracking: mask history and quality tracking
         self.last_valid_mask = None  # Fallback mask for failed frames
         self.last_valid_mask_area = 0
         self.mask_quality_history = deque(maxlen=10)  # Track last 10 frames' quality
         self.mask_area_history = deque(maxlen=10)  # Track mask area history for trend detection
-
-        # Depth-based region growing parameters
-        self.depth_tolerance_mm = 250  # Allow 150mm depth variation for clustering
-        self.min_cluster_size = 500  # Minimum pixels for a valid cluster
-        self.morph_kernel_size = 5  # Kernel size for morphological operations
-
-        # Ground plane removal parameters
-        self.ground_removal_enabled = True  # Enable ground plane removal
-        self.ground_height_threshold = 0.10  # Remove points below 10cm height (in meters)
-        self.min_points_above_ground = 100  # Minimum points required after ground removal
 
         # State
         self.bridge = CvBridge()
@@ -823,94 +809,6 @@ class RealtimeSTCNTracker(object):
         # Return points and original count
         return points, len(x_cam_valid)
 
-    def grow_mask_with_depth_clustering(self, rgb_mask, depth_image):
-        """
-        Use depth clustering to grow the RGB mask and capture the full human region.
-        The RGB mask is sometimes incomplete - this method uses depth information to
-        recover missing parts by region growing with depth similarity.
-
-        Args:
-            rgb_mask: Binary mask from RGB tracking (uint8, 0 or 255)
-            depth_image: Depth image in mm (uint16 or float)
-
-        Returns:
-            expanded_mask: Grown mask that includes full human region (uint8, 0 or 255)
-        """
-        if rgb_mask is None or depth_image is None:
-            return rgb_mask
-
-        # Resize masks to match if needed
-        if rgb_mask.shape != depth_image.shape:
-            rgb_mask = cv2.resize(rgb_mask, (depth_image.shape[1], depth_image.shape[0]),
-                                 interpolation=cv2.INTER_NEAREST)
-
-        # Convert to binary
-        seed_mask = (rgb_mask > 128).astype(np.uint8)
-
-        # Check if seed mask is valid
-        seed_pixels = np.count_nonzero(seed_mask)
-        if seed_pixels < self.min_cluster_size:
-            rospy.logwarn("Seed mask too small (%d pixels), skipping depth clustering" % seed_pixels)
-            return rgb_mask
-
-        # Extract depth statistics from seed region
-        depth_values = depth_image[seed_mask > 0]
-        valid_depths = depth_values[(depth_values > 300) & (depth_values < 5000)]  # 0.3m to 5m
-
-        if len(valid_depths) < 100:
-            rospy.logwarn("Not enough valid depth values in seed region, skipping clustering")
-            return rgb_mask
-
-        # Use median and MAD (Median Absolute Deviation) for robust statistics
-        median_depth = np.median(valid_depths)
-        mad = np.median(np.abs(valid_depths - median_depth))
-
-        # Define depth range for clustering
-        depth_min = median_depth - self.depth_tolerance_mm
-        depth_max = median_depth + self.depth_tolerance_mm
-
-        # Create depth-based mask: pixels with depth in valid range
-        depth_cluster_mask = ((depth_image >= depth_min) &
-                             (depth_image <= depth_max) &
-                             (depth_image > 0)).astype(np.uint8)
-
-        # Morphological closing to fill small gaps
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                          (self.morph_kernel_size, self.morph_kernel_size))
-        depth_cluster_mask = cv2.morphologyEx(depth_cluster_mask, cv2.MORPH_CLOSE, kernel)
-
-        # Find connected components in the depth cluster mask
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            depth_cluster_mask, connectivity=8
-        )
-
-        # Find which component(s) overlap with the seed mask
-        seed_labels = np.unique(labels[seed_mask > 0])
-        seed_labels = seed_labels[seed_labels != 0]  # Remove background label
-
-        if len(seed_labels) == 0:
-            rospy.logwarn("No depth cluster overlaps with seed mask")
-            return rgb_mask
-
-        # Create expanded mask from all components that overlap with seed
-        expanded_mask = np.zeros_like(depth_cluster_mask)
-        for label in seed_labels:
-            component_mask = (labels == label).astype(np.uint8)
-            component_size = stats[label, cv2.CC_STAT_AREA]
-
-            # Only include components that are large enough
-            if component_size >= self.min_cluster_size:
-                expanded_mask = np.maximum(expanded_mask, component_mask)
-
-        # Morphological opening to remove small noise
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        expanded_mask = cv2.morphologyEx(expanded_mask, cv2.MORPH_OPEN, kernel_open)
-
-        # Convert back to 0-255 range
-        expanded_mask = (expanded_mask * 255).astype(np.uint8)
-
-        return expanded_mask
-
     def transform_and_combine_pointclouds(self, points01, points02, timestamp):
         """
         Transform both pointclouds to base_link frame, concatenate, and downsample.
@@ -997,45 +895,6 @@ class RealtimeSTCNTracker(object):
 
         return combined
 
-    def remove_ground_plane(self, points):
-        """
-        Remove ground points by simple height filtering.
-        Removes all points below the height threshold in base_link frame.
-
-        Args:
-            points: Nx3 numpy array of points in base_link frame (X-forward, Y-left, Z-up)
-
-        Returns:
-            filtered_points: Mx3 numpy array with ground points removed
-        """
-        if points is None or len(points) < self.min_points_above_ground:
-            return points
-
-        if not self.ground_removal_enabled:
-            return points
-
-        try:
-            n_points = len(points)
-
-            # Filter by Z-axis height (Z-up in base_link frame)
-            # Keep only points above the height threshold
-            above_ground = points[:, 2] > self.ground_height_threshold
-
-            filtered_points = points[above_ground]
-
-            # Safety check: ensure we didn't remove all points
-            if len(filtered_points) < self.min_points_above_ground:
-                rospy.logwarn("[Ground Removal] Too few points remaining (%d), returning original" % len(filtered_points))
-                return points
-
-            return filtered_points
-
-        except Exception as e:
-            rospy.logerr("[Ground Removal] Failed: %s" % str(e))
-            import traceback
-            rospy.logerr(traceback.format_exc())
-            return points
-
     def process_frame(self, event=None):
         """Main processing loop"""
         with self.lock:
@@ -1073,7 +932,6 @@ class RealtimeSTCNTracker(object):
 
         if not self.tracking_initialized:
             # Detection phase: look for first mask
-            rospy.loginfo("[YOLO] Running initial detection...")
             mask, num_det, detect_time = self.extract_mask_keep_middle(stitched_bgr)
 
             if mask is not None:
@@ -1147,7 +1005,7 @@ class RealtimeSTCNTracker(object):
 
                 # Only run YOLO if consistently lost for multiple frames
                 if self.poor_tracking_count >= self.tracking_lost_threshold:
-                    rospy.loginfo("[YOLO] Running re-detection due to tracking loss...")
+                    rospy.logwarn("Tracking consistently lost! Running YOLO to re-detect...")
                     new_mask, num_det, detect_time = self.extract_mask_keep_middle(stitched_bgr)
 
                     if new_mask is not None:
@@ -1240,35 +1098,6 @@ class RealtimeSTCNTracker(object):
                     self.last_valid_mask = mask.copy()
                     self.last_valid_mask_area = mask_area
 
-                # Periodic YOLO execution for mask refinement
-                frames_since_last_yolo = self.current_frame_idx - self.last_yolo_frame
-                if frames_since_last_yolo >= self.yolo_period_frames:
-                    rospy.loginfo("[YOLO] Running periodic detection (every %d frames)..." % self.yolo_period_frames)
-                    yolo_mask, num_det, detect_time = self.extract_mask_keep_middle(stitched_bgr)
-                    self.last_yolo_frame = self.current_frame_idx
-
-                    if yolo_mask is not None and num_det > 0:
-                        rospy.loginfo("[YOLO Periodic] Frame %d: %.3f ms (%d detections)" %
-                                     (self.current_frame_idx, detect_time * 1000, num_det))
-
-                        # Merge YOLO mask with tracking mask (union operation)
-                        current_tracking_mask = mask if mask is not None else np.zeros(orig_size, dtype=np.uint8)
-                        merged_mask = cv2.bitwise_or(current_tracking_mask, yolo_mask)
-
-                        # Compute increment (what YOLO added)
-                        increment_mask = self.compute_mask_increment(current_tracking_mask, merged_mask)
-                        increment_pixels = np.count_nonzero(increment_mask > 128)
-
-                        if increment_pixels > 100:
-                            # Update memory bank with the increment
-                            self.update_memory_bank_with_increment(frame_tensor, increment_mask, orig_size)
-                            rospy.loginfo("[YOLO Periodic] Merged masks: +%d pixels from YOLO" % increment_pixels)
-                        else:
-                            rospy.loginfo("[YOLO Periodic] YOLO mask adds no new pixels")
-
-                        # Use merged mask for this frame
-                        mask = merged_mask
-
         # Publish pointclouds for each camera
         if mask is not None:
             # Split mask back to individual cameras
@@ -1327,15 +1156,6 @@ class RealtimeSTCNTracker(object):
                 # Upscale mask to original resolution for depth (1280x720)
                 mask_cam02 = cv2.resize(mask_cam02_ds, (orig_w2, orig_h2), interpolation=cv2.INTER_NEAREST)
 
-                # Apply depth-based region growing to expand incomplete masks
-                # This uses depth clustering to recover missing parts of the human
-                mask_cam01_expanded = self.grow_mask_with_depth_clustering(mask_cam01, depth01)
-                mask_cam02_expanded = self.grow_mask_with_depth_clustering(mask_cam02, depth02)
-
-                # Use expanded masks for pointcloud generation
-                mask_cam01 = mask_cam01_expanded
-                mask_cam02 = mask_cam02_expanded
-
                 # Publish masks for debugging
                 try:
                     mask_msg01 = self.bridge.cv2_to_imgmsg(mask_cam01, encoding="mono8")
@@ -1374,10 +1194,6 @@ class RealtimeSTCNTracker(object):
 
                 # Transform both pointclouds to base_link, concatenate, and downsample to 5000 pts
                 combined_points = self.transform_and_combine_pointclouds(points01, points02, timestamp)
-
-                # Remove ground plane from combined pointcloud
-                if combined_points is not None:
-                    combined_points = self.remove_ground_plane(combined_points)
 
                 # Publish combined pointcloud in base_link frame
                 if combined_points is not None:
