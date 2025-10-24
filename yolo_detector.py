@@ -4,6 +4,12 @@
 通过stdin/stdout与主程序通信，完全隔离CUDA上下文
 """
 
+# Suppress TensorFlow/CUDA warnings BEFORE any imports
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TF warnings
+os.environ['CUDA_MODULE_LOADING'] = 'LAZY'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
 import sys
 import cv2
 import numpy as np
@@ -39,14 +45,15 @@ class YOLODetector:
 
         frame_ds = cv2.resize(frame_bgr, (ds_w, ds_h), interpolation=cv2.INTER_AREA)
 
-        # Use FP16 and optimized parameters for faster inference on Jetson
+        # Use CPU to avoid CUDA context conflicts with main process
         results = self.model.predict(
             frame_ds[..., ::-1],
             classes=[0],           # Person class only
             conf=self.conf_threshold,
             verbose=False,
-            device="cuda",
-            half=True,             # FP16 for ~2x speedup on Jetson
+            device="cpu",          # Use CPU to avoid CUDA fork issues
+            half=False,
+            amp=False,
             imgsz=320,             # Match downsampled size
             max_det=10             # Limit max detections for speed
         )

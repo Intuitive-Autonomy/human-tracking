@@ -1,11 +1,11 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
-Real-time STCN Tracking ROS1 Node
+Real-time STCN Tracking ROS2 Node
 订阅两个摄像头话题，拼接后实时跟踪人体mask并可视化
 
 Subscribes to:
-  - /ob_camera_01/color/image_raw
-  - /ob_camera_02/color/image_raw
+  - /camera_01/color/image_raw
+  - /camera_02/color/image_raw
 
 Workflow:
 1) 收集图像帧，从第一帧开始用YOLO检测人体mask (keep_middle策略)
@@ -18,21 +18,25 @@ import os
 os.environ['CUDA_MODULE_LOADING'] = 'LAZY'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-import rospy
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, PointCloud2, PointField, CameraInfo
-import sensor_msgs.point_cloud2 as pc2
+from sensor_msgs_py import point_cloud2 as pc2
 from collections import deque
 import threading
 import subprocess
 import pickle
 import time
 import struct
-import tf2_ros
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 
 # Import PyTorch components first
 from torchvision import transforms
@@ -44,9 +48,9 @@ from dataset.util import all_to_onehot
 from model.aggregate import aggregate
 
 
-class RealtimeSTCNTracker(object):
+class RealtimeSTCNTracker(Node):
     def __init__(self):
-        rospy.init_node('realtime_stcn_tracker', anonymous=True)
+        super().__init__('realtime_stcn_tracker')
 
         # Configuration - Optimized for Jetson
         self.conf_threshold = 0.2
@@ -73,7 +77,7 @@ class RealtimeSTCNTracker(object):
         self.mask_area_history = deque(maxlen=10)  # Track mask area history for trend detection
 
         # Depth-based region growing parameters
-        self.depth_tolerance_mm = 250  # Allow 150mm depth variation for clustering
+        self.depth_tolerance_mm = 500  # Allow 500mm depth variation for clustering
         self.min_cluster_size = 500  # Minimum pixels for a valid cluster
         self.morph_kernel_size = 5  # Kernel size for morphological operations
 
@@ -93,13 +97,17 @@ class RealtimeSTCNTracker(object):
         self.camera_02_depth = None
         self.last_timestamp = None
 
+        # Image timestamps (store original timestamps from camera messages)
+        self.camera_01_timestamp = None
+        self.camera_02_timestamp = None
+
         # Camera intrinsics - will be populated from camera_info topics
         self.cam01_intrinsics = None
         self.cam02_intrinsics = None
 
         # TF buffer for transforming pointclouds to base_link
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # CUDA stream for async operations on Jetson
         self.cuda_stream = torch.cuda.Stream()
@@ -127,14 +135,14 @@ class RealtimeSTCNTracker(object):
             memory_fraction = min(8.0 / total_memory, 1.0)  # 8GB or max available
             torch.cuda.set_per_process_memory_fraction(memory_fraction, device=0)
             torch.cuda.empty_cache()
-            rospy.loginfo("GPU memory limited to 8GB")
+            self.get_logger().info("GPU memory limited to 8GB")
 
         # Use subprocess for YOLO to isolate CUDA context
-        rospy.loginfo("YOLO will run in isolated subprocess...")
+        self.get_logger().info("YOLO will run in isolated subprocess...")
         self.yolo_process = None
         self.yolo_ready = False
 
-        rospy.loginfo("Loading STCN model...")
+        self.get_logger().info("Loading STCN model...")
         torch.autograd.set_grad_enabled(False)
         self.stcn_model = STCN().cuda().eval()
         model_path = "saves/stcn.pth"
@@ -152,67 +160,60 @@ class RealtimeSTCNTracker(object):
         # Convert to FP16 for Jetson optimization
         if self.use_fp16:
             self.stcn_model = self.stcn_model.half()
-            rospy.loginfo("STCN model converted to FP16 for Jetson acceleration")
+            self.get_logger().info("STCN model converted to FP16 for Jetson acceleration")
 
-        rospy.loginfo("Models loaded successfully!")
+        self.get_logger().info("Models loaded successfully!")
 
         # Subscribers - Camera Info
-        self.sub_info01 = rospy.Subscriber(
-            '/ob_camera_01/depth/camera_info', CameraInfo, self.callback_info01, queue_size=1
-        )
-        self.sub_info02 = rospy.Subscriber(
-            '/ob_camera_02/depth/camera_info', CameraInfo, self.callback_info02, queue_size=1
-        )
+        self.sub_info01 = self.create_subscription(
+            CameraInfo, '/camera_01/depth/camera_info', self.callback_info01, 1)
+        self.sub_info02 = self.create_subscription(
+            CameraInfo, '/camera_02/depth/camera_info', self.callback_info02, 1)
 
         # Subscribers - Color images
-        self.sub_cam01 = rospy.Subscriber(
-            '/ob_camera_01/color/image_raw', Image, self.callback_cam01_color, queue_size=1
-        )
-        self.sub_cam02 = rospy.Subscriber(
-            '/ob_camera_02/color/image_raw', Image, self.callback_cam02_color, queue_size=1
-        )
+        self.sub_cam01 = self.create_subscription(
+            Image, '/camera_01/color/image_raw', self.callback_cam01_color, 1)
+        self.sub_cam02 = self.create_subscription(
+            Image, '/camera_02/color/image_raw', self.callback_cam02_color, 1)
 
         # Subscribers - Depth images
-        self.sub_cam01_depth = rospy.Subscriber(
-            '/ob_camera_01/depth/image_raw', Image, self.callback_cam01_depth, queue_size=1
-        )
-        self.sub_cam02_depth = rospy.Subscriber(
-            '/ob_camera_02/depth/image_raw', Image, self.callback_cam02_depth, queue_size=1
-        )
+        self.sub_cam01_depth = self.create_subscription(
+            Image, '/camera_01/depth/image_raw', self.callback_cam01_depth, 1)
+        self.sub_cam02_depth = self.create_subscription(
+            Image, '/camera_02/depth/image_raw', self.callback_cam02_depth, 1)
 
         # Publisher - Combined human pointcloud in base_link frame
-        self.pub_human_pc = rospy.Publisher(
-            '/human_pointcloud', PointCloud2, queue_size=1
-        )
+        self.pub_human_pc = self.create_publisher(
+            PointCloud2, '/human_pointcloud', 1)
 
         # Publishers - Masks (for debugging)
-        self.pub_mask01 = rospy.Publisher(
-            '/ob_camera_01/human_mask', Image, queue_size=1
-        )
-        self.pub_mask02 = rospy.Publisher(
-            '/ob_camera_02/human_mask', Image, queue_size=1
-        )
+        self.pub_mask01 = self.create_publisher(
+            Image, '/camera_01/human_mask', 1)
+        self.pub_mask02 = self.create_publisher(
+            Image, '/camera_02/human_mask', 1)
 
         # Timer for processing
-        self.timer = rospy.Timer(rospy.Duration(0.033), self.process_frame)  # ~30 Hz
+        self.timer = self.create_timer(0.033, self.process_frame)  # ~30 Hz
 
-        rospy.loginfo("ROS1 node initialized. Waiting for image messages...")
+        self.get_logger().info("ROS2 node initialized. Waiting for image messages...")
 
     def callback_cam01_color(self, msg):
         try:
             img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             with self.lock:
                 self.camera_01_img = img
+                self.camera_01_timestamp = msg.header.stamp
         except Exception as e:
-            rospy.logerr("Failed to convert camera_01 color image: %s" % str(e))
+            self.get_logger().error("Failed to convert camera_01 color image: %s" % str(e))
 
     def callback_cam02_color(self, msg):
         try:
             img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             with self.lock:
                 self.camera_02_img = img
+                self.camera_02_timestamp = msg.header.stamp
         except Exception as e:
-            rospy.logerr("Failed to convert camera_02 color image: %s" % str(e))
+            self.get_logger().error("Failed to convert camera_02 color image: %s" % str(e))
 
     def callback_cam01_depth(self, msg):
         try:
@@ -220,7 +221,7 @@ class RealtimeSTCNTracker(object):
             with self.lock:
                 self.camera_01_depth = depth
         except Exception as e:
-            rospy.logerr("Failed to convert camera_01 depth image: %s" % str(e))
+            self.get_logger().error("Failed to convert camera_01 depth image: %s" % str(e))
 
     def callback_cam02_depth(self, msg):
         try:
@@ -228,33 +229,37 @@ class RealtimeSTCNTracker(object):
             with self.lock:
                 self.camera_02_depth = depth
         except Exception as e:
-            rospy.logerr("Failed to convert camera_02 depth image: %s" % str(e))
+            self.get_logger().error("Failed to convert camera_02 depth image: %s" % str(e))
 
     def callback_info01(self, msg):
         """Callback for camera 01 camera_info"""
         if self.cam01_intrinsics is None:
-            # Extract intrinsics from camera info K matrix: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+            # Extract intrinsics from camera info k matrix: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+            # In ROS2, k is a tuple/array
+            k = msg.k
             self.cam01_intrinsics = {
-                'fx': msg.K[0],
-                'fy': msg.K[4],
-                'cx': msg.K[2],
-                'cy': msg.K[5]
+                'fx': k[0],
+                'fy': k[4],
+                'cx': k[2],
+                'cy': k[5]
             }
-            rospy.loginfo("Camera 01 intrinsics: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f" %
+            self.get_logger().info("Camera 01 intrinsics: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f" %
                          (self.cam01_intrinsics['fx'], self.cam01_intrinsics['fy'],
                           self.cam01_intrinsics['cx'], self.cam01_intrinsics['cy']))
 
     def callback_info02(self, msg):
         """Callback for camera 02 camera_info"""
         if self.cam02_intrinsics is None:
-            # Extract intrinsics from camera info K matrix: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+            # Extract intrinsics from camera info k matrix: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+            # In ROS2, k is a tuple/array
+            k = msg.k
             self.cam02_intrinsics = {
-                'fx': msg.K[0],
-                'fy': msg.K[4],
-                'cx': msg.K[2],
-                'cy': msg.K[5]
+                'fx': k[0],
+                'fy': k[4],
+                'cx': k[2],
+                'cy': k[5]
             }
-            rospy.loginfo("Camera 02 intrinsics: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f" %
+            self.get_logger().info("Camera 02 intrinsics: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f" %
                          (self.cam02_intrinsics['fx'], self.cam02_intrinsics['fy'],
                           self.cam02_intrinsics['cx'], self.cam02_intrinsics['cy']))
 
@@ -293,15 +298,17 @@ class RealtimeSTCNTracker(object):
     def _start_yolo_subprocess(self):
         """启动YOLO子进程"""
         if self.yolo_process is None:
-            rospy.loginfo("Starting YOLO subprocess...")
+            self.get_logger().info("Starting YOLO subprocess...")
             try:
+                # Use the directory where this script is located
+                script_dir = os.path.dirname(os.path.abspath(__file__))
                 self.yolo_process = subprocess.Popen(
                     ['python3', 'yolo_detector.py'],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,  # Ignore stderr
+                    stderr=subprocess.DEVNULL,  # Discard stderr to avoid pipe interference
                     bufsize=0,
-                    cwd='/home/woosh/Documents/human-tracking'
+                    cwd=script_dir
                 )
                 # Wait for READY signal from stdout
                 import select
@@ -310,18 +317,18 @@ class RealtimeSTCNTracker(object):
                     line = self.yolo_process.stdout.readline().decode().strip()
                     if "READY" in line:
                         self.yolo_ready = True
-                        rospy.loginfo("YOLO subprocess ready!")
+                        self.get_logger().info("YOLO subprocess ready!")
                     else:
-                        rospy.logerr("YOLO subprocess unexpected output: %s" % line)
+                        self.get_logger().error("YOLO subprocess unexpected output: %s" % line)
                 else:
-                    rospy.logerr("YOLO subprocess timeout (15s)")
+                    self.get_logger().error("YOLO subprocess timeout (15s)")
                     if self.yolo_process:
                         self.yolo_process.kill()
                         self.yolo_process = None
             except Exception as e:
-                rospy.logerr("Failed to start YOLO subprocess: %s" % str(e))
+                self.get_logger().error("Failed to start YOLO subprocess: %s" % str(e))
                 import traceback
-                rospy.logerr(traceback.format_exc())
+                self.get_logger().error(traceback.format_exc())
                 if self.yolo_process:
                     self.yolo_process.kill()
                 self.yolo_process = None
@@ -348,7 +355,7 @@ class RealtimeSTCNTracker(object):
             # Read result - read in chunks to avoid truncation
             size_bytes = self.yolo_process.stdout.read(4)
             if len(size_bytes) != 4:
-                rospy.logerr("Failed to read result size from YOLO subprocess")
+                self.get_logger().error("Failed to read result size from YOLO subprocess")
                 raise RuntimeError("Invalid size bytes")
 
             result_size = int.from_bytes(size_bytes, 'little')
@@ -364,7 +371,7 @@ class RealtimeSTCNTracker(object):
                 remaining -= len(chunk)
 
             if len(result_data) != result_size:
-                rospy.logerr("Incomplete result: got %d, expected %d" % (len(result_data), result_size))
+                self.get_logger().error("Incomplete result: got %d, expected %d" % (len(result_data), result_size))
                 raise RuntimeError("Incomplete data")
 
             result = pickle.loads(result_data)
@@ -374,7 +381,7 @@ class RealtimeSTCNTracker(object):
             return result['mask'], result['num_det'], detection_time
 
         except Exception as e:
-            rospy.logerr("YOLO subprocess communication error: %s" % str(e))
+            self.get_logger().error("YOLO subprocess communication error: %s" % str(e))
             self.yolo_ready = False
             if self.yolo_process:
                 self.yolo_process.kill()
@@ -634,7 +641,7 @@ class RealtimeSTCNTracker(object):
 
             increment_pixels = np.count_nonzero(increment_mask > 128)
             if increment_pixels < 100:  # Too small to be meaningful
-                rospy.logwarn("Increment mask too small (%d pixels), skipping" % increment_pixels)
+                self.get_logger().warning("Increment mask too small (%d pixels), skipping" % increment_pixels)
                 return
 
             # Prepare frame for encoding
@@ -696,13 +703,13 @@ class RealtimeSTCNTracker(object):
 
                     bank.add_memory(key_k, key_v[i:i+1])
 
-            rospy.loginfo("[Memory Increment Update] Frame %d: Added %d pixels to memory" %
+            self.get_logger().info("[Memory Increment Update] Frame %d: Added %d pixels to memory" %
                          (self.current_frame_idx, increment_pixels))
 
         except Exception as e:
-            rospy.logerr("Failed to update memory with increment: %s" % str(e))
+            self.get_logger().error("Failed to update memory with increment: %s" % str(e))
             import traceback
-            rospy.logerr(traceback.format_exc())
+            self.get_logger().error(traceback.format_exc())
 
     def is_tracking_lost(self, mask):
         """
@@ -850,7 +857,7 @@ class RealtimeSTCNTracker(object):
         # Check if seed mask is valid
         seed_pixels = np.count_nonzero(seed_mask)
         if seed_pixels < self.min_cluster_size:
-            rospy.logwarn("Seed mask too small (%d pixels), skipping depth clustering" % seed_pixels)
+            self.get_logger().warning("Seed mask too small (%d pixels), skipping depth clustering" % seed_pixels)
             return rgb_mask
 
         # Extract depth statistics from seed region
@@ -858,7 +865,7 @@ class RealtimeSTCNTracker(object):
         valid_depths = depth_values[(depth_values > 300) & (depth_values < 5000)]  # 0.3m to 5m
 
         if len(valid_depths) < 100:
-            rospy.logwarn("Not enough valid depth values in seed region, skipping clustering")
+            self.get_logger().warning("Not enough valid depth values in seed region, skipping clustering")
             return rgb_mask
 
         # Use median and MAD (Median Absolute Deviation) for robust statistics
@@ -889,7 +896,7 @@ class RealtimeSTCNTracker(object):
         seed_labels = seed_labels[seed_labels != 0]  # Remove background label
 
         if len(seed_labels) == 0:
-            rospy.logwarn("No depth cluster overlaps with seed mask")
+            self.get_logger().warning("No depth cluster overlaps with seed mask")
             return rgb_mask
 
         # Create expanded mask from all components that overlap with seed
@@ -916,8 +923,8 @@ class RealtimeSTCNTracker(object):
         Transform both pointclouds to base_link frame, concatenate, and downsample.
 
         Args:
-            points01: Nx3 numpy array of points in ob_camera_01_link frame (or None)
-            points02: Nx3 numpy array of points in ob_camera_02_link frame (or None)
+            points01: Nx3 numpy array of points in camera_01_link frame (or None)
+            points02: Nx3 numpy array of points in camera_02_link frame (or None)
             timestamp: rospy.Time timestamp for TF lookup
 
         Returns:
@@ -929,8 +936,10 @@ class RealtimeSTCNTracker(object):
         if points01 is not None and len(points01) > 0:
             try:
                 # Lookup transform from camera to base_link
+                # Use Time() to get the latest available transform (like rospy.Time(0) in ROS1)
+                from rclpy.time import Time
                 transform = self.tf_buffer.lookup_transform(
-                    'base_link', 'ob_camera_01_link', timestamp, rospy.Duration(0.1)
+                    'base_link', 'camera_01_link', Time(), rclpy.duration.Duration(seconds=1.0)
                 )
 
                 # Extract rotation and translation
@@ -951,16 +960,18 @@ class RealtimeSTCNTracker(object):
                 points01_base = (R @ points01.T).T + t
                 combined_points.append(points01_base)
 
-            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-                    tf2_ros.ExtrapolationException) as e:
-                rospy.logwarn("Failed to lookup transform for camera 01: %s" % str(e))
+            except (LookupException, ConnectivityException,
+                    ExtrapolationException) as e:
+                self.get_logger().warning("Failed to lookup transform for camera 01: %s" % str(e))
 
         # Transform camera 02 points to base_link
         if points02 is not None and len(points02) > 0:
             try:
                 # Lookup transform from camera to base_link
+                # Use Time() to get the latest available transform (like rospy.Time(0) in ROS1)
+                from rclpy.time import Time
                 transform = self.tf_buffer.lookup_transform(
-                    'base_link', 'ob_camera_02_link', timestamp, rospy.Duration(0.1)
+                    'base_link', 'camera_02_link', Time(), rclpy.duration.Duration(seconds=1.0)
                 )
 
                 # Extract rotation and translation
@@ -980,9 +991,9 @@ class RealtimeSTCNTracker(object):
                 points02_base = (R @ points02.T).T + t
                 combined_points.append(points02_base)
 
-            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-                    tf2_ros.ExtrapolationException) as e:
-                rospy.logwarn("Failed to lookup transform for camera 02: %s" % str(e))
+            except (LookupException, ConnectivityException,
+                    ExtrapolationException) as e:
+                self.get_logger().warning("Failed to lookup transform for camera 02: %s" % str(e))
 
         # Concatenate all transformed points
         if len(combined_points) == 0:
@@ -1025,15 +1036,15 @@ class RealtimeSTCNTracker(object):
 
             # Safety check: ensure we didn't remove all points
             if len(filtered_points) < self.min_points_above_ground:
-                rospy.logwarn("[Ground Removal] Too few points remaining (%d), returning original" % len(filtered_points))
+                self.get_logger().warning("[Ground Removal] Too few points remaining (%d), returning original" % len(filtered_points))
                 return points
 
             return filtered_points
 
         except Exception as e:
-            rospy.logerr("[Ground Removal] Failed: %s" % str(e))
+            self.get_logger().error("[Ground Removal] Failed: %s" % str(e))
             import traceback
-            rospy.logerr(traceback.format_exc())
+            self.get_logger().error(traceback.format_exc())
             return points
 
     def process_frame(self, event=None):
@@ -1067,17 +1078,17 @@ class RealtimeSTCNTracker(object):
         # After tracking starts, clear buffer to save memory
         elif len(self.frame_buffer) > 0:
             self.frame_buffer.clear()
-            rospy.loginfo("Frame buffer cleared after tracking initialization")
+            self.get_logger().info("Frame buffer cleared after tracking initialization")
 
         mask = None
 
         if not self.tracking_initialized:
             # Detection phase: look for first mask
-            rospy.loginfo("[YOLO] Running initial detection...")
+            self.get_logger().info("[YOLO] Running initial detection...")
             mask, num_det, detect_time = self.extract_mask_keep_middle(stitched_bgr)
 
             if mask is not None:
-                rospy.loginfo("[YOLO Detection] Frame %d: %.3f ms (%d detections)" % (self.current_frame_idx, detect_time * 1000, num_det))
+                self.get_logger().info("[YOLO Detection] Frame %d: %.3f ms (%d detections)" % (self.current_frame_idx, detect_time * 1000, num_det))
                 self.first_mask = mask
                 # mask_frame_idx should be the last index in the frame buffer (most recent frame)
                 self.mask_frame_idx = len(self.frame_buffer) - 1
@@ -1086,9 +1097,9 @@ class RealtimeSTCNTracker(object):
                 try:
                     self.initialize_tracking(mask, orig_size)
                 except Exception as e:
-                    rospy.logerr("Failed to initialize tracking: %s" % str(e))
+                    self.get_logger().error("Failed to initialize tracking: %s" % str(e))
                     import traceback
-                    rospy.logerr(traceback.format_exc())
+                    self.get_logger().error(traceback.format_exc())
                     self.tracking_initialized = False
 
         else:
@@ -1096,10 +1107,10 @@ class RealtimeSTCNTracker(object):
             # Always try to track first
             try:
                 mask, track_time = self.track_frame(frame_tensor, orig_size)
-                rospy.loginfo("[STCN Tracking] Frame %d: %.3f ms" % (self.current_frame_idx, track_time * 1000))
+                self.get_logger().info("[STCN Tracking] Frame %d: %.3f ms" % (self.current_frame_idx, track_time * 1000))
             except RuntimeError as e:
                     if "out of memory" in str(e):
-                        rospy.logerr("OOM! Clearing memory and reducing memory bank...")
+                        self.get_logger().error("OOM! Clearing memory and reducing memory bank...")
                         # Emergency cleanup
                         torch.cuda.empty_cache()
                         import gc
@@ -1117,12 +1128,12 @@ class RealtimeSTCNTracker(object):
                         torch.cuda.empty_cache()
                         mask = np.zeros(orig_size, dtype=np.uint8)
                     else:
-                        rospy.logerr("Tracking failed: %s" % str(e))
+                        self.get_logger().error("Tracking failed: %s" % str(e))
                         mask = np.zeros(orig_size, dtype=np.uint8)
             except Exception as e:
                 import traceback
-                rospy.logerr("Tracking failed: %s" % str(e))
-                rospy.logerr("Traceback: %s" % traceback.format_exc())
+                self.get_logger().error("Tracking failed: %s" % str(e))
+                self.get_logger().error("Traceback: %s" % traceback.format_exc())
                 mask = None
 
             # Improved: Check tracking quality with detailed diagnosis
@@ -1131,7 +1142,7 @@ class RealtimeSTCNTracker(object):
             if is_lost:
                 self.poor_tracking_count += 1
                 diag_str = ", ".join([k for k, v in diagnosis.items() if v])
-                rospy.logwarn("Poor tracking detected [%s] - Quality: %.2f - Frame %d (%d/%d)" %
+                self.get_logger().warning("Poor tracking detected [%s] - Quality: %.2f - Frame %d (%d/%d)" %
                             (diag_str, quality_score, self.current_frame_idx,
                              self.poor_tracking_count, self.tracking_lost_threshold))
 
@@ -1139,7 +1150,7 @@ class RealtimeSTCNTracker(object):
                 if self.last_valid_mask is not None and quality_score > 0.2:
                     # If tracking is slightly degraded but not completely lost,
                     # use the last valid mask instead of empty mask
-                    rospy.loginfo("Using fallback mask from frame %d (area: %d pixels)" %
+                    self.get_logger().info("Using fallback mask from frame %d (area: %d pixels)" %
                                 (self.current_frame_idx - 1, self.last_valid_mask_area))
                     mask = self.last_valid_mask.copy()
                     # Don't increment poor_tracking_count if we recovered with fallback
@@ -1147,11 +1158,11 @@ class RealtimeSTCNTracker(object):
 
                 # Only run YOLO if consistently lost for multiple frames
                 if self.poor_tracking_count >= self.tracking_lost_threshold:
-                    rospy.loginfo("[YOLO] Running re-detection due to tracking loss...")
+                    self.get_logger().info("[YOLO] Running re-detection due to tracking loss...")
                     new_mask, num_det, detect_time = self.extract_mask_keep_middle(stitched_bgr)
 
                     if new_mask is not None:
-                        rospy.loginfo("[YOLO Re-detect] Frame %d: %.3f ms (%d detections)" % (self.current_frame_idx, detect_time * 1000, num_det))
+                        self.get_logger().info("[YOLO Re-detect] Frame %d: %.3f ms (%d detections)" % (self.current_frame_idx, detect_time * 1000, num_det))
 
                         # ==== New logic: Compare YOLO mask with current tracking mask ====
                         # Get current tracking mask for comparison
@@ -1162,13 +1173,13 @@ class RealtimeSTCNTracker(object):
                             current_tracking_mask, new_mask, threshold=0.8
                         )
 
-                        rospy.loginfo("[YOLO-Tracking Compare] Coverage: %.1f%% (80%% threshold)" %
+                        self.get_logger().info("[YOLO-Tracking Compare] Coverage: %.1f%% (80%% threshold)" %
                                      (coverage_ratio * 100))
 
                         if is_covered:
                             # Tracking mask is 80%+ in YOLO mask
                             # Use increment update instead of full re-initialization
-                            rospy.loginfo("[YOLO Update Strategy] Using increment update (coverage: %.1f%%)" %
+                            self.get_logger().info("[YOLO Update Strategy] Using increment update (coverage: %.1f%%)" %
                                          (coverage_ratio * 100))
 
                             # Compute increment mask (new pixels from YOLO)
@@ -1184,7 +1195,7 @@ class RealtimeSTCNTracker(object):
                         else:
                             # Tracking mask is not well-covered by YOLO mask
                             # This means tracking drifted significantly, need full re-initialization
-                            rospy.loginfo("[YOLO Update Strategy] Using full re-initialization (coverage: %.1f%%)" %
+                            self.get_logger().info("[YOLO Update Strategy] Using full re-initialization (coverage: %.1f%%)" %
                                          (coverage_ratio * 100))
 
                             try:
@@ -1219,12 +1230,12 @@ class RealtimeSTCNTracker(object):
                                 self.frame_buffer.clear()
                                 self.mask_frame_idx = self.current_frame_idx
                                 self.poor_tracking_count = 0  # Reset counter
-                                rospy.loginfo("Tracking re-initialized successfully")
+                                self.get_logger().info("Tracking re-initialized successfully")
                             except Exception as e:
-                                rospy.logerr("Failed to re-initialize tracking: %s" % str(e))
+                                self.get_logger().error("Failed to re-initialize tracking: %s" % str(e))
                                 mask = np.zeros(orig_size, dtype=np.uint8)
                     else:
-                        rospy.logwarn("YOLO re-detection failed, using fallback mask")
+                        self.get_logger().warning("YOLO re-detection failed, using fallback mask")
                         if self.last_valid_mask is not None:
                             mask = self.last_valid_mask.copy()
                         else:
@@ -1243,12 +1254,12 @@ class RealtimeSTCNTracker(object):
                 # Periodic YOLO execution for mask refinement
                 frames_since_last_yolo = self.current_frame_idx - self.last_yolo_frame
                 if frames_since_last_yolo >= self.yolo_period_frames:
-                    rospy.loginfo("[YOLO] Running periodic detection (every %d frames)..." % self.yolo_period_frames)
+                    self.get_logger().info("[YOLO] Running periodic detection (every %d frames)..." % self.yolo_period_frames)
                     yolo_mask, num_det, detect_time = self.extract_mask_keep_middle(stitched_bgr)
                     self.last_yolo_frame = self.current_frame_idx
 
                     if yolo_mask is not None and num_det > 0:
-                        rospy.loginfo("[YOLO Periodic] Frame %d: %.3f ms (%d detections)" %
+                        self.get_logger().info("[YOLO Periodic] Frame %d: %.3f ms (%d detections)" %
                                      (self.current_frame_idx, detect_time * 1000, num_det))
 
                         # Merge YOLO mask with tracking mask (union operation)
@@ -1262,9 +1273,9 @@ class RealtimeSTCNTracker(object):
                         if increment_pixels > 100:
                             # Update memory bank with the increment
                             self.update_memory_bank_with_increment(frame_tensor, increment_mask, orig_size)
-                            rospy.loginfo("[YOLO Periodic] Merged masks: +%d pixels from YOLO" % increment_pixels)
+                            self.get_logger().info("[YOLO Periodic] Merged masks: +%d pixels from YOLO" % increment_pixels)
                         else:
-                            rospy.loginfo("[YOLO Periodic] YOLO mask adds no new pixels")
+                            self.get_logger().info("[YOLO Periodic] YOLO mask adds no new pixels")
 
                         # Use merged mask for this frame
                         mask = merged_mask
@@ -1329,35 +1340,38 @@ class RealtimeSTCNTracker(object):
 
                 # Apply depth-based region growing to expand incomplete masks
                 # This uses depth clustering to recover missing parts of the human
-                mask_cam01_expanded = self.grow_mask_with_depth_clustering(mask_cam01, depth01)
-                mask_cam02_expanded = self.grow_mask_with_depth_clustering(mask_cam02, depth02)
+                # Temporarily disabled to debug pointcloud generation
+                # mask_cam01_expanded = self.grow_mask_with_depth_clustering(mask_cam01, depth01)
+                # mask_cam02_expanded = self.grow_mask_with_depth_clustering(mask_cam02, depth02)
 
                 # Use expanded masks for pointcloud generation
-                mask_cam01 = mask_cam01_expanded
-                mask_cam02 = mask_cam02_expanded
+                # mask_cam01 = mask_cam01_expanded
+                # mask_cam02 = mask_cam02_expanded
 
-                # Publish masks for debugging
+                # Publish masks for debugging - use original camera timestamps
                 try:
                     mask_msg01 = self.bridge.cv2_to_imgmsg(mask_cam01, encoding="mono8")
-                    mask_msg01.header.stamp = rospy.Time.now()
-                    mask_msg01.header.frame_id = 'ob_camera_01_link'
+                    # Use original camera timestamp for proper synchronization in RViz
+                    mask_msg01.header.stamp = self.camera_01_timestamp if self.camera_01_timestamp else self.get_clock().now().to_msg()
+                    mask_msg01.header.frame_id = 'camera_01_link'
                     self.pub_mask01.publish(mask_msg01)
 
                     mask_msg02 = self.bridge.cv2_to_imgmsg(mask_cam02, encoding="mono8")
-                    mask_msg02.header.stamp = rospy.Time.now()
-                    mask_msg02.header.frame_id = 'ob_camera_02_link'
+                    # Use original camera timestamp for proper synchronization in RViz
+                    mask_msg02.header.stamp = self.camera_02_timestamp if self.camera_02_timestamp else self.get_clock().now().to_msg()
+                    mask_msg02.header.frame_id = 'camera_02_link'
                     self.pub_mask02.publish(mask_msg02)
                 except Exception as e:
-                    rospy.logerr("Failed to publish masks: %s" % str(e))
+                    self.get_logger().error("Failed to publish masks: %s" % str(e))
 
                 # Generate pointclouds from both cameras (without downsampling yet)
-                timestamp = rospy.Time.now()
+                timestamp = self.get_clock().now().to_msg()
                 points01, points02 = None, None
 
                 # Extract points from camera 01
                 if self.cam01_intrinsics is not None:
                     result = self.depth_to_pointcloud(
-                        depth01, mask_cam01, 'ob_camera_01_link',
+                        depth01, mask_cam01, 'camera_01_link',
                         self.cam01_intrinsics, timestamp, max_points=None
                     )
                     if result[0] is not None:
@@ -1366,7 +1380,7 @@ class RealtimeSTCNTracker(object):
                 # Extract points from camera 02
                 if self.cam02_intrinsics is not None:
                     result = self.depth_to_pointcloud(
-                        depth02, mask_cam02, 'ob_camera_02_link',
+                        depth02, mask_cam02, 'camera_02_link',
                         self.cam02_intrinsics, timestamp, max_points=None
                     )
                     if result[0] is not None:
@@ -1381,13 +1395,14 @@ class RealtimeSTCNTracker(object):
 
                 # Publish combined pointcloud in base_link frame
                 if combined_points is not None:
-                    header = rospy.Header()
+                    from std_msgs.msg import Header
+                    header = Header()
                     header.stamp = timestamp
                     header.frame_id = 'base_link'
                     fields = [
-                        PointField('x', 0, PointField.FLOAT32, 1),
-                        PointField('y', 4, PointField.FLOAT32, 1),
-                        PointField('z', 8, PointField.FLOAT32, 1),
+                        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
                     ]
                     pc_msg = pc2.create_cloud(header, fields, combined_points)
                     self.pub_human_pc.publish(pc_msg)
@@ -1402,12 +1417,17 @@ class RealtimeSTCNTracker(object):
 
 
 if __name__ == "__main__":
+    rclpy.init()
     try:
         tracker = RealtimeSTCNTracker()
-        rospy.spin()
+        rclpy.spin(tracker)
     except KeyboardInterrupt:
         pass
     except Exception as e:
         print("Fatal error: %s" % str(e))
         import traceback
         traceback.print_exc()
+    finally:
+        if 'tracker' in locals():
+            tracker.destroy_node()
+        rclpy.shutdown()
