@@ -11,6 +11,10 @@ Workflow:
 1) 收集图像帧，从第一帧开始用YOLO检测人体mask (keep_middle策略)
 2) 找到第一个有效mask后，初始化STCN跟踪器
 3) 后续帧使用STCN实时跟踪并可视化结果
+
+Usage:
+Run LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtiff.so.5 python3 realtime_stcn_tracking.py on x86 computer
+Run LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libtiff.so.5 python3 realtime_stcn_tracking.py on arm64 computer
 """
 
 # Set environment variables BEFORE importing any libraries
