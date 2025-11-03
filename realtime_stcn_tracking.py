@@ -90,6 +90,11 @@ class RealtimeSTCNTracker(Node):
         self.ground_height_threshold = 0.10  # Remove points below 10cm height (in meters)
         self.min_points_above_ground = 100  # Minimum points required after ground removal
 
+        # Seam-based downsampling parameters
+        self.seam_downsample_enabled = True  # Enable distance-based downsampling near seam
+        self.seam_min_keep_prob = 0.2  # Minimum keep probability near seam (20%)
+        self.seam_max_keep_prob = 1.0  # Maximum keep probability far from seam (100%)
+
         # State
         self.bridge = CvBridge()
         self.lock = threading.Lock()
@@ -784,6 +789,57 @@ class RealtimeSTCNTracker(Node):
 
         return is_lost, quality_score, diagnosis
 
+    def downsample_by_seam_distance(self, points, v_coords, camera_frame, seam_v_position):
+        """
+        Downsample points based on distance to stitching seam.
+        Points closer to seam are downsampled more aggressively.
+
+        Args:
+            points: Nx3 numpy array of 3D points
+            v_coords: N array of v (vertical) pixel coordinates in downsampled image space
+            camera_frame: 'camera_01_link' or 'camera_02_link'
+            seam_v_position: Vertical pixel position of seam in downsampled image
+
+        Returns:
+            downsampled_points: Mx3 numpy array after distance-based downsampling
+        """
+        if points is None or len(points) == 0:
+            return points
+
+        if not self.seam_downsample_enabled:
+            return points
+
+        # Calculate distance from each point to seam
+        distance_to_seam = np.abs(v_coords - seam_v_position)
+
+        # Normalize distance (0 = at seam, 1 = max distance)
+        max_distance = np.max(distance_to_seam) + 1e-6
+        normalized_distance = distance_to_seam / max_distance
+
+        # Calculate keep probability for each point
+        # Points far from seam: high probability (close to max_keep_prob)
+        # Points near seam: low probability (close to min_keep_prob)
+        min_keep_prob = self.seam_min_keep_prob
+        max_keep_prob = self.seam_max_keep_prob
+
+        # Quadratic function: more aggressive near seam
+        # Using x^2 gives smooth transition with more aggressive downsampling near seam
+        keep_probability = min_keep_prob + (max_keep_prob - min_keep_prob) * (normalized_distance ** 2)
+
+        # Generate random values for each point
+        random_values = np.random.random(len(points))
+
+        # Keep points where random value < keep probability
+        keep_mask = random_values < keep_probability
+
+        downsampled_points = points[keep_mask]
+
+        kept_ratio = len(downsampled_points) / len(points)
+        self.get_logger().info("[%s Seam Downsample] %d -> %d points (%.1f%% kept)" %
+                             (camera_frame, len(points), len(downsampled_points), kept_ratio * 100))
+
+        return downsampled_points
+
     def depth_to_pointcloud(self, depth_image, mask, camera_frame, intrinsics, timestamp, max_points=None):
         """Convert depth image and mask to pointcloud with correct intrinsics and coordinate transform"""
         if depth_image is None or mask is None or intrinsics is None:
@@ -820,10 +876,11 @@ class RealtimeSTCNTracker(Node):
         y_cam = (v_grid - cy) * z / fy
         z_cam = z
 
-        # Extract valid points
+        # Extract valid points and their v coordinates
         x_cam_valid = x_cam[valid_mask]
         y_cam_valid = y_cam[valid_mask]
         z_cam_valid = z_cam[valid_mask]
+        v_coords_valid = v_grid[valid_mask]  # Keep track of vertical pixel positions
 
         # Transform from camera coordinates (Y-up, Z-forward) to ROS coordinates (Z-up, X-forward)
         # Camera: X-right, Y-down, Z-forward
@@ -837,15 +894,16 @@ class RealtimeSTCNTracker(Node):
         points = np.stack((x_ros, y_ros, z_ros), axis=-1)
 
         if len(points) == 0:
-            return None, 0
+            return None, 0, None
 
         # Downsample if max_points is specified
         if max_points is not None and len(points) > max_points:
             indices = np.random.choice(len(points), max_points, replace=False)
             points = points[indices]
+            v_coords_valid = v_coords_valid[indices]
 
-        # Return points and original count
-        return points, len(x_cam_valid)
+        # Return points, original count, and v coordinates for seam-based downsampling
+        return points, len(x_cam_valid), v_coords_valid
 
     def grow_mask_with_depth_clustering(self, rgb_mask, depth_image):
         """
@@ -948,6 +1006,8 @@ class RealtimeSTCNTracker(Node):
             Nx3 numpy array of combined points in base_link frame, or None if both inputs are None
         """
         combined_points = []
+        points01_base = None
+        points02_base = None
 
         # Transform camera 01 points to base_link
         if points01 is not None and len(points01) > 0:
@@ -1325,27 +1385,54 @@ class RealtimeSTCNTracker(Node):
                 except Exception as e:
                     self.get_logger().error("Failed to publish masks: %s" % str(e))
 
-                # Generate pointclouds from both cameras (without downsampling yet)
+                # Generate pointclouds from both cameras with seam-based downsampling
                 timestamp = self.get_clock().now().to_msg()
                 points01, points02 = None, None
 
-                # Extract points from camera 01
+                # Calculate seam position in downsampled image space (depth images are at 640x360)
+                # Camera 01 is top, camera 02 is bottom
+                # Seam is at the bottom of camera 01's view
+                cam01_height_ds = depth01.shape[0] // 2  # Downsampled height
+                seam_v_cam01 = cam01_height_ds - 1  # Bottom of camera 01
+
+                # For camera 02, seam is at the top
+                seam_v_cam02 = 0  # Top of camera 02
+
+                # Extract points from camera 01 with seam-based downsampling
                 if self.cam01_intrinsics is not None:
                     result = self.depth_to_pointcloud(
                         depth01, mask_cam01, 'camera_01_link',
                         self.cam01_intrinsics, timestamp, max_points=None
                     )
                     if result[0] is not None:
-                        points01 = result[0]
+                        points01_raw = result[0]
+                        v_coords01 = result[2]
 
-                # Extract points from camera 02
+                        # Apply seam-based downsampling
+                        if v_coords01 is not None:
+                            points01 = self.downsample_by_seam_distance(
+                                points01_raw, v_coords01, 'camera_01_link', seam_v_cam01
+                            )
+                        else:
+                            points01 = points01_raw
+
+                # Extract points from camera 02 with seam-based downsampling
                 if self.cam02_intrinsics is not None:
                     result = self.depth_to_pointcloud(
                         depth02, mask_cam02, 'camera_02_link',
                         self.cam02_intrinsics, timestamp, max_points=None
                     )
                     if result[0] is not None:
-                        points02 = result[0]
+                        points02_raw = result[0]
+                        v_coords02 = result[2]
+
+                        # Apply seam-based downsampling
+                        if v_coords02 is not None:
+                            points02 = self.downsample_by_seam_distance(
+                                points02_raw, v_coords02, 'camera_02_link', seam_v_cam02
+                            )
+                        else:
+                            points02 = points02_raw
 
                 # Transform both pointclouds to base_link and concatenate (no downsampling yet)
                 combined_points, points01_base, points02_base = self.transform_and_combine_pointclouds(
