@@ -196,6 +196,10 @@ class RealtimeSTCNTracker(Node):
         self.pub_mask02 = self.create_publisher(
             Image, '/camera_02/human_mask', 1)
 
+
+        # Processing flag to prevent concurrent processing
+        self.processing = False
+
         self.get_logger().info("ROS2 node initialized. Waiting for image messages...")
 
     def callback_cam01_color(self, msg):
@@ -215,6 +219,14 @@ class RealtimeSTCNTracker(Node):
             with self.lock:
                 self.camera_02_img = img
                 self.camera_02_timestamp = msg.header.stamp
+
+            # Trigger processing when new frame arrives (only if not already processing)
+            if not self.processing and self.camera_01_img is not None:
+                self.processing = True
+                try:
+                    self.process_frame()
+                finally:
+                    self.processing = False
         except Exception as e:
             self.get_logger().error("Failed to convert camera_02 color image: %s" % str(e))
 
@@ -1002,16 +1014,12 @@ class RealtimeSTCNTracker(Node):
 
         # Concatenate all transformed points
         if len(combined_points) == 0:
-            return None
+            return None, None, None
 
         combined = np.vstack(combined_points)
 
-        # Downsample to 5000 points if needed
-        if len(combined) > 5000:
-            indices = np.random.choice(len(combined), 5000, replace=False)
-            combined = combined[indices]
-
-        return combined
+        # Return combined and individual camera pointclouds for later processing
+        return combined, points01_base, points02_base
 
     def remove_ground_plane(self, points):
         """
@@ -1339,12 +1347,27 @@ class RealtimeSTCNTracker(Node):
                     if result[0] is not None:
                         points02 = result[0]
 
-                # Transform both pointclouds to base_link, concatenate, and downsample to 5000 pts
-                combined_points = self.transform_and_combine_pointclouds(points01, points02, timestamp)
+                # Transform both pointclouds to base_link and concatenate (no downsampling yet)
+                combined_points, points01_base, points02_base = self.transform_and_combine_pointclouds(
+                    points01, points02, timestamp
+                )
 
-                # Remove ground plane from combined pointcloud
+                # Remove ground plane FIRST, then downsample
                 if combined_points is not None:
+                    points_before_ground = len(combined_points)
                     combined_points = self.remove_ground_plane(combined_points)
+
+                    if combined_points is not None:
+                        points_after_ground = len(combined_points)
+                        self.get_logger().info("[Ground Removal] %d -> %d points (removed %d)" %
+                                             (points_before_ground, points_after_ground,
+                                              points_before_ground - points_after_ground))
+
+                        # Now downsample AFTER ground removal
+                        if len(combined_points) > 5000:
+                            indices = np.random.choice(len(combined_points), 5000, replace=False)
+                            combined_points = combined_points[indices]
+                            self.get_logger().info("[Downsample] %d -> 5000 points" % points_after_ground)
 
                 # Publish combined pointcloud in base_link frame
                 if combined_points is not None:
