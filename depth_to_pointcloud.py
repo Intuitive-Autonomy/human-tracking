@@ -1,21 +1,22 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
-Depth to PointCloud Publisher for ROS1
+Depth to PointCloud Publisher for ROS2
 Subscribes to depth images and publishes full pointclouds for each camera
 No tracking - just raw depth to pointcloud conversion
 """
 
-import rospy
+import rclpy
+from rclpy.node import Node
 import cv2
 import numpy as np
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, PointCloud2, PointField, CameraInfo
-import sensor_msgs.point_cloud2 as pc2
+from sensor_msgs_py import point_cloud2 as pc2
 import struct
 
-class DepthToPointCloudPublisher:
+class DepthToPointCloudPublisher(Node):
     def __init__(self):
-        rospy.init_node('depth_to_pointcloud_publisher', anonymous=False)
+        super().__init__('depth_to_pointcloud_publisher')
 
         self.bridge = CvBridge()
 
@@ -24,64 +25,70 @@ class DepthToPointCloudPublisher:
         self.cam02_intrinsics = None
 
         # Depth processing parameters
-        self.min_depth = rospy.get_param('~min_depth', 0.3)  # meters
-        self.max_depth = rospy.get_param('~max_depth', 5.0)  # meters
-        self.max_points = rospy.get_param('~max_points', 5000)  # maximum points per cloud
+        self.declare_parameter('min_depth', 0.3)
+        self.declare_parameter('max_depth', 5.0)
+        self.declare_parameter('max_points', 5000)
+
+        self.min_depth = self.get_parameter('min_depth').value
+        self.max_depth = self.get_parameter('max_depth').value
+        self.max_points = self.get_parameter('max_points').value
 
         # Subscribers - Camera Info
-        self.sub_info01 = rospy.Subscriber(
-            '/ob_camera_01/depth/camera_info', CameraInfo, self.callback_info01, queue_size=1
+        self.sub_info01 = self.create_subscription(
+            CameraInfo, '/camera_01/depth/camera_info', self.callback_info01, 1
         )
-        self.sub_info02 = rospy.Subscriber(
-            '/ob_camera_02/depth/camera_info', CameraInfo, self.callback_info02, queue_size=1
+        self.sub_info02 = self.create_subscription(
+            CameraInfo, '/camera_02/depth/camera_info', self.callback_info02, 1
         )
 
         # Subscribers - Depth images
-        self.sub_depth01 = rospy.Subscriber(
-            '/ob_camera_01/depth/image_raw', Image, self.callback_depth01, queue_size=1
+        self.sub_depth01 = self.create_subscription(
+            Image, '/camera_01/depth/image_raw', self.callback_depth01, 1
         )
-        self.sub_depth02 = rospy.Subscriber(
-            '/ob_camera_02/depth/image_raw', Image, self.callback_depth02, queue_size=1
+        self.sub_depth02 = self.create_subscription(
+            Image, '/camera_02/depth/image_raw', self.callback_depth02, 1
         )
 
         # Publishers - Pointclouds
-        self.pub_pc01 = rospy.Publisher(
-            '/ob_camera_01/pointcloud', PointCloud2, queue_size=1
+        self.pub_pc01 = self.create_publisher(
+            PointCloud2, '/camera_01/pointcloud', 1
         )
-        self.pub_pc02 = rospy.Publisher(
-            '/ob_camera_02/pointcloud', PointCloud2, queue_size=1
+        self.pub_pc02 = self.create_publisher(
+            PointCloud2, '/camera_02/pointcloud', 1
         )
 
-        rospy.loginfo("Depth to PointCloud Publisher initialized")
-        rospy.loginfo("Waiting for camera_info topics to get intrinsics...")
-        rospy.loginfo("Depth range: %.2fm to %.2fm" % (self.min_depth, self.max_depth))
-        rospy.loginfo("Max points per cloud: %d" % self.max_points)
+        self.get_logger().info("Depth to PointCloud Publisher initialized")
+        self.get_logger().info("Waiting for camera_info topics to get intrinsics...")
+        self.get_logger().info("Depth range: %.2fm to %.2fm" % (self.min_depth, self.max_depth))
+        self.get_logger().info("Max points per cloud: %d" % self.max_points)
 
     def callback_info01(self, msg):
         """Callback for camera 01 camera_info"""
         if self.cam01_intrinsics is None:
-            # Extract intrinsics from camera info K matrix: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+            # Extract intrinsics from camera info k matrix: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+            k = msg.k
             self.cam01_intrinsics = {
-                'fx': msg.K[0],
-                'fy': msg.K[4],
-                'cx': msg.K[2],
-                'cy': msg.K[5]
+                'fx': k[0],
+                'fy': k[4],
+                'cx': k[2],
+                'cy': k[5]
             }
-            rospy.loginfo("Camera 01 intrinsics received: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f" %
+            self.get_logger().info("Camera 01 intrinsics received: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f" %
                          (self.cam01_intrinsics['fx'], self.cam01_intrinsics['fy'],
                           self.cam01_intrinsics['cx'], self.cam01_intrinsics['cy']))
 
     def callback_info02(self, msg):
         """Callback for camera 02 camera_info"""
         if self.cam02_intrinsics is None:
-            # Extract intrinsics from camera info K matrix: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+            # Extract intrinsics from camera info k matrix: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+            k = msg.k
             self.cam02_intrinsics = {
-                'fx': msg.K[0],
-                'fy': msg.K[4],
-                'cx': msg.K[2],
-                'cy': msg.K[5]
+                'fx': k[0],
+                'fy': k[4],
+                'cx': k[2],
+                'cy': k[5]
             }
-            rospy.loginfo("Camera 02 intrinsics received: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f" %
+            self.get_logger().info("Camera 02 intrinsics received: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f" %
                          (self.cam02_intrinsics['fx'], self.cam02_intrinsics['fy'],
                           self.cam02_intrinsics['cx'], self.cam02_intrinsics['cy']))
 
@@ -151,14 +158,15 @@ class DepthToPointCloudPublisher:
             points = points[indices]
 
         # Create PointCloud2 message using faster method
-        header = rospy.Header()
+        from std_msgs.msg import Header
+        header = Header()
         header.stamp = timestamp  # Use original depth image timestamp
         header.frame_id = camera_frame
 
         fields = [
-            PointField('x', 0, PointField.FLOAT32, 1),
-            PointField('y', 4, PointField.FLOAT32, 1),
-            PointField('z', 8, PointField.FLOAT32, 1),
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
         ]
 
         # Use create_cloud which is faster than manual point packing
@@ -175,14 +183,17 @@ class DepthToPointCloudPublisher:
             # Convert ROS Image message to OpenCV image
             depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
 
+            # Rotate camera_01 depth by 180 degrees
+            depth = cv2.rotate(depth, cv2.ROTATE_180)
+
             # Convert to pointcloud with original timestamp and intrinsics
-            pc_msg = self.depth_to_pointcloud(depth, 'ob_camera_01_link', msg.header.stamp, self.cam01_intrinsics)
+            pc_msg = self.depth_to_pointcloud(depth, 'camera_01_link', msg.header.stamp, self.cam01_intrinsics)
 
             # Publish pointcloud
             if pc_msg is not None:
                 self.pub_pc01.publish(pc_msg)
         except Exception as e:
-            rospy.logerr("Failed to process camera_01 depth: %s" % str(e))
+            self.get_logger().error("Failed to process camera_01 depth: %s" % str(e))
 
     def callback_depth02(self, msg):
         """Callback for camera 02 depth images"""
@@ -195,24 +206,29 @@ class DepthToPointCloudPublisher:
             depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
 
             # Convert to pointcloud with original timestamp and intrinsics
-            pc_msg = self.depth_to_pointcloud(depth, 'ob_camera_02_link', msg.header.stamp, self.cam02_intrinsics)
+            pc_msg = self.depth_to_pointcloud(depth, 'camera_02_link', msg.header.stamp, self.cam02_intrinsics)
 
             # Publish pointcloud
             if pc_msg is not None:
                 self.pub_pc02.publish(pc_msg)
         except Exception as e:
-            rospy.logerr("Failed to process camera_02 depth: %s" % str(e))
+            self.get_logger().error("Failed to process camera_02 depth: %s" % str(e))
 
 def main():
+    rclpy.init()
     try:
         node = DepthToPointCloudPublisher()
-        rospy.spin()
-    except rospy.ROSInterruptException:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
         pass
     except Exception as e:
-        rospy.logerr("Fatal error: %s" % str(e))
+        print("Fatal error: %s" % str(e))
         import traceback
         traceback.print_exc()
+    finally:
+        if 'node' in locals():
+            node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

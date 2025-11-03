@@ -57,13 +57,13 @@ class RealtimeSTCNTracker(Node):
         super().__init__('realtime_stcn_tracker')
 
         # Configuration - Optimized for Jetson
-        self.conf_threshold = 0.2
-        self.resolution = 480  # Reduced from 720 for faster inference on Jetson
-        self.angle_degrees = 25
-        self.input_scale = 0.5  # Downsample 1280x720 -> 640x360 before stitching
-        self.max_memory_frames = 15  # Reduced for Jetson memory constraints
-        self.mem_every = 60  # Update memory every 60 frames (2 sec at 30fps) for smoother performance
-        self.top_k = 5  # Reduced for faster processing on Jetson
+        self.conf_threshold = 0.3
+        self.resolution = 360
+        self.angle_degrees = 15
+        self.input_scale = 0.5
+        self.max_memory_frames = 15
+        self.mem_every = 3
+        self.top_k = 3
 
         # Tracking quality thresholds - Only run YOLO when tracking is lost
         self.min_mask_area = 500  # Minimum pixels for valid tracking
@@ -71,7 +71,7 @@ class RealtimeSTCNTracker(Node):
         self.poor_tracking_count = 0  # Counter for poor tracking frames
 
         # Periodic YOLO execution for mask refinement
-        self.yolo_period_frames = 60  # Run YOLO every 60 frames (~2 seconds at 30fps)
+        self.yolo_period_frames = 15  # Run YOLO every 60 frames (~2 seconds at 30fps)
         self.last_yolo_frame = -1000  # Last frame where YOLO was run
 
         # Improved tracking: mask history and quality tracking
@@ -81,9 +81,9 @@ class RealtimeSTCNTracker(Node):
         self.mask_area_history = deque(maxlen=10)  # Track mask area history for trend detection
 
         # Depth-based region growing parameters
-        self.depth_tolerance_mm = 500  # Allow 500mm depth variation for clustering
+        self.depth_tolerance_mm = 600  # Allow depth variation for clustering
         self.min_cluster_size = 500  # Minimum pixels for a valid cluster
-        self.morph_kernel_size = 5  # Kernel size for morphological operations
+        self.morph_kernel_size = 3  # Kernel size for morphological operations
 
         # Ground plane removal parameters
         self.ground_removal_enabled = True  # Enable ground plane removal
@@ -196,14 +196,13 @@ class RealtimeSTCNTracker(Node):
         self.pub_mask02 = self.create_publisher(
             Image, '/camera_02/human_mask', 1)
 
-        # Timer for processing
-        self.timer = self.create_timer(0.033, self.process_frame)  # ~30 Hz
-
         self.get_logger().info("ROS2 node initialized. Waiting for image messages...")
 
     def callback_cam01_color(self, msg):
         try:
             img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            # Rotate camera_01 by 180 degrees
+            img = cv2.rotate(img, cv2.ROTATE_180)
             with self.lock:
                 self.camera_01_img = img
                 self.camera_01_timestamp = msg.header.stamp
@@ -222,6 +221,8 @@ class RealtimeSTCNTracker(Node):
     def callback_cam01_depth(self, msg):
         try:
             depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+            # Rotate camera_01 depth by 180 degrees
+            depth = cv2.rotate(depth, cv2.ROTATE_180)
             with self.lock:
                 self.camera_01_depth = depth
         except Exception as e:
@@ -1168,76 +1169,24 @@ class RealtimeSTCNTracker(Node):
                     if new_mask is not None:
                         self.get_logger().info("[YOLO Re-detect] Frame %d: %.3f ms (%d detections)" % (self.current_frame_idx, detect_time * 1000, num_det))
 
-                        # ==== New logic: Compare YOLO mask with current tracking mask ====
+                        # Always use incremental update strategy
                         # Get current tracking mask for comparison
                         current_tracking_mask = mask if mask is not None else None
 
-                        # Check coverage
-                        is_covered, coverage_ratio = self.check_yolo_mask_coverage(
-                            current_tracking_mask, new_mask, threshold=0.8
-                        )
-
-                        self.get_logger().info("[YOLO-Tracking Compare] Coverage: %.1f%% (80%% threshold)" %
-                                     (coverage_ratio * 100))
-
-                        if is_covered:
-                            # Tracking mask is 80%+ in YOLO mask
-                            # Use increment update instead of full re-initialization
-                            self.get_logger().info("[YOLO Update Strategy] Using increment update (coverage: %.1f%%)" %
-                                         (coverage_ratio * 100))
-
-                            # Compute increment mask (new pixels from YOLO)
+                        # Compute increment mask (new pixels from YOLO)
+                        if current_tracking_mask is not None:
                             increment_mask = self.compute_mask_increment(current_tracking_mask, new_mask)
-
-                            # Update memory bank with increment
-                            self.update_memory_bank_with_increment(frame_tensor, increment_mask, orig_size)
-
-                            # Update mask to be the merged one (YOLO provides new information)
-                            mask = new_mask
-                            self.poor_tracking_count = 0  # Reset counter
-
                         else:
-                            # Tracking mask is not well-covered by YOLO mask
-                            # This means tracking drifted significantly, need full re-initialization
-                            self.get_logger().info("[YOLO Update Strategy] Using full re-initialization (coverage: %.1f%%)" %
-                                         (coverage_ratio * 100))
+                            # If no current mask, use full YOLO mask as increment
+                            increment_mask = new_mask
 
-                            try:
-                                # Clear old memory banks
-                                for bank in self.mem_banks.values():
-                                    if bank.mem_k is not None:
-                                        del bank.mem_k, bank.mem_v
-                                        bank.mem_k = None
-                                        bank.mem_v = None
-                                torch.cuda.empty_cache()
+                        # Update memory bank with increment
+                        self.update_memory_bank_with_increment(frame_tensor, increment_mask, orig_size)
 
-                                # Recreate memory banks
-                                from inference_memory_bank import MemoryBank
-                                self.mem_banks = {}
-                                for oi in range(1, self.num_objects + 1):
-                                    bank = MemoryBank(k=1, top_k=self.top_k)
-                                    bank.temp_k = None
-                                    bank.temp_v = None
-                                    self.mem_banks[oi] = bank
-
-                                # Re-initialize tracking
-                                self.frame_buffer.clear()
-                                self.frame_buffer.append({
-                                    'tensor': frame_tensor,
-                                    'rgb': frame_rgb,
-                                    'bgr': stitched_bgr,
-                                    'size': orig_size
-                                })
-                                self.mask_frame_idx = 0
-                                self.initialize_tracking(new_mask, orig_size)
-                                mask = new_mask
-                                self.frame_buffer.clear()
-                                self.mask_frame_idx = self.current_frame_idx
-                                self.poor_tracking_count = 0  # Reset counter
-                                self.get_logger().info("Tracking re-initialized successfully")
-                            except Exception as e:
-                                self.get_logger().error("Failed to re-initialize tracking: %s" % str(e))
-                                mask = np.zeros(orig_size, dtype=np.uint8)
+                        # Update mask to be the YOLO mask (provides new information)
+                        mask = new_mask
+                        self.poor_tracking_count = 0  # Reset counter
+                        self.get_logger().info("[YOLO Update Strategy] Incremental update completed")
                     else:
                         self.get_logger().warning("YOLO re-detection failed, using fallback mask")
                         if self.last_valid_mask is not None:
@@ -1345,12 +1294,12 @@ class RealtimeSTCNTracker(Node):
                 # Apply depth-based region growing to expand incomplete masks
                 # This uses depth clustering to recover missing parts of the human
                 # Temporarily disabled to debug pointcloud generation
-                # mask_cam01_expanded = self.grow_mask_with_depth_clustering(mask_cam01, depth01)
-                # mask_cam02_expanded = self.grow_mask_with_depth_clustering(mask_cam02, depth02)
+                mask_cam01_expanded = self.grow_mask_with_depth_clustering(mask_cam01, depth01)
+                mask_cam02_expanded = self.grow_mask_with_depth_clustering(mask_cam02, depth02)
 
                 # Use expanded masks for pointcloud generation
-                # mask_cam01 = mask_cam01_expanded
-                # mask_cam02 = mask_cam02_expanded
+                mask_cam01 = mask_cam01_expanded
+                mask_cam02 = mask_cam02_expanded
 
                 # Publish masks for debugging - use original camera timestamps
                 try:

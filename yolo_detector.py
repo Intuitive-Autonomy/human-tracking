@@ -51,7 +51,7 @@ class YOLODetector:
             classes=[0],           # Person class only
             conf=self.conf_threshold,
             verbose=False,
-            device="cpu",          # Use CPU to avoid CUDA fork issues
+            device="cuda:0",          # Use CPU to avoid CUDA fork issues
             half=False,
             amp=False,
             imgsz=320,             # Match downsampled size
