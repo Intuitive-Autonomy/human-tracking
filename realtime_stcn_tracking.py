@@ -281,7 +281,7 @@ class RealtimeSTCNTracker(Node):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,  # Ignore stderr
                     bufsize=0,
-                    cwd='/home/hanxi/code/ia_robot_sim/src/ia_perception_human_tracking'
+                    cwd=os.path.dirname(os.path.abspath(__file__))  # Current file dir
                 )
                 # Wait for READY signal from stdout
                 import select
