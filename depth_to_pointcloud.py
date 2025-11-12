@@ -183,9 +183,6 @@ class DepthToPointCloudPublisher(Node):
             # Convert ROS Image message to OpenCV image
             depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
 
-            # Rotate camera_01 depth by 180 degrees
-            depth = cv2.rotate(depth, cv2.ROTATE_180)
-
             # Convert to pointcloud with original timestamp and intrinsics
             pc_msg = self.depth_to_pointcloud(depth, 'camera_01_link', msg.header.stamp, self.cam01_intrinsics)
 

@@ -32,20 +32,20 @@ class CameraTFPublisher(Node):
         pitch_cam1 = math.radians(-30) + global_pitch_offset  # -30 - 15 = -45 degrees total
         r_cam1 = Rotation.from_euler('xyz', [0, pitch_cam1, 0])
         quat_cam1 = r_cam1.as_quat()  # [x, y, z, w]
-        trans_cam1 = (0.0, -0.0225, base_height - 0.015)
+        trans_cam1 = (0.0, 0.0, base_height - 0.015)
 
         # Camera 2: +30 deg pitch rotation + global offset, overall height + relative +1.5cm offset
         # Horizontal offset: 2.25cm (Y-axis, left side)
         pitch_cam2 = math.radians(30) + global_pitch_offset  # +30 - 15 = +15 degrees total
         r_cam2 = Rotation.from_euler('xyz', [0, pitch_cam2, 0])
         quat_cam2 = r_cam2.as_quat()  # [x, y, z, w]
-        trans_cam2 = (0.0, 0.0225, base_height + 0.015)
+        trans_cam2 = (0.0, 0.0, base_height + 0.015)
 
         self.get_logger().info("Publishing camera TF transforms...")
         self.get_logger().info("Global pitch offset: -15deg")
         self.get_logger().info(f"Base height: {base_height:.2f}m (53cm)")
-        self.get_logger().info(f"Camera 1: pitch=-45deg, y={trans_cam1[1]:.4f}m (+2.25cm), z={trans_cam1[2]:.3f}m")
-        self.get_logger().info(f"Camera 2: pitch=+15deg, y={trans_cam2[1]:.4f}m (-2.25cm), z={trans_cam2[2]:.3f}m")
+        self.get_logger().info(f"Camera 1: pitch=-45deg, z={trans_cam1[2]:.3f}m")
+        self.get_logger().info(f"Camera 2: pitch=+15deg, z={trans_cam2[2]:.3f}m")
 
         # Store transforms
         self.trans_cam1 = trans_cam1

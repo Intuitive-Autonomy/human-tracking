@@ -63,7 +63,7 @@ class RealtimeSTCNTracker(Node):
         self.input_scale = 0.5
         self.max_memory_frames = 15
         self.mem_every = 3
-        self.top_k = 3
+        self.top_k = 5
 
         # Tracking quality thresholds - Only run YOLO when tracking is lost
         self.min_mask_area = 500  # Minimum pixels for valid tracking
@@ -81,13 +81,15 @@ class RealtimeSTCNTracker(Node):
         self.mask_area_history = deque(maxlen=10)  # Track mask area history for trend detection
 
         # Depth-based region growing parameters
-        self.depth_tolerance_mm = 600  # Allow depth variation for clustering
+        self.depth_tolerance_mm = 400  # Allow depth variation for clustering (horizontal)
+        self.depth_tolerance_z_mm = 600  # Allow larger depth variation in Z direction (vertical, 60cm)
         self.min_cluster_size = 500  # Minimum pixels for a valid cluster
         self.morph_kernel_size = 3  # Kernel size for morphological operations
 
         # Ground plane removal parameters
         self.ground_removal_enabled = True  # Enable ground plane removal
         self.ground_height_threshold = 0.10  # Remove points below 10cm height (in meters)
+        self.ceiling_height_threshold = 2.0  # Remove points above 2m height (in meters)
         self.min_points_above_ground = 100  # Minimum points required after ground removal
 
         # Seam-based downsampling parameters
@@ -210,8 +212,6 @@ class RealtimeSTCNTracker(Node):
     def callback_cam01_color(self, msg):
         try:
             img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            # Rotate camera_01 by 180 degrees
-            img = cv2.rotate(img, cv2.ROTATE_180)
             with self.lock:
                 self.camera_01_img = img
                 self.camera_01_timestamp = msg.header.stamp
@@ -238,8 +238,6 @@ class RealtimeSTCNTracker(Node):
     def callback_cam01_depth(self, msg):
         try:
             depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            # Rotate camera_01 depth by 180 degrees
-            depth = cv2.rotate(depth, cv2.ROTATE_180)
             with self.lock:
                 self.camera_01_depth = depth
         except Exception as e:
@@ -834,10 +832,6 @@ class RealtimeSTCNTracker(Node):
 
         downsampled_points = points[keep_mask]
 
-        kept_ratio = len(downsampled_points) / len(points)
-        self.get_logger().info("[%s Seam Downsample] %d -> %d points (%.1f%% kept)" %
-                             (camera_frame, len(points), len(downsampled_points), kept_ratio * 100))
-
         return downsampled_points
 
     def depth_to_pointcloud(self, depth_image, mask, camera_frame, intrinsics, timestamp, max_points=None):
@@ -908,8 +902,8 @@ class RealtimeSTCNTracker(Node):
     def grow_mask_with_depth_clustering(self, rgb_mask, depth_image):
         """
         Use depth clustering to grow the RGB mask and capture the full human region.
-        The RGB mask is sometimes incomplete - this method uses depth information to
-        recover missing parts by region growing with depth similarity.
+        Uses anisotropic depth tolerance: larger in vertical direction (60cm) for human height,
+        smaller in horizontal direction (30cm) to avoid neighboring objects.
 
         Args:
             rgb_mask: Binary mask from RGB tracking (uint8, 0 or 255)
@@ -935,26 +929,53 @@ class RealtimeSTCNTracker(Node):
             self.get_logger().warning("Seed mask too small (%d pixels), skipping depth clustering" % seed_pixels)
             return rgb_mask
 
-        # Extract depth statistics from seed region
-        depth_values = depth_image[seed_mask > 0]
-        valid_depths = depth_values[(depth_values > 300) & (depth_values < 5000)]  # 0.3m to 5m
+        # Extract depth statistics from seed region for each row (vertical direction)
+        h, w = depth_image.shape
 
-        if len(valid_depths) < 100:
-            self.get_logger().warning("Not enough valid depth values in seed region, skipping clustering")
+        # Find bounding box of seed mask
+        rows, cols = np.where(seed_mask > 0)
+        if len(rows) == 0:
             return rgb_mask
 
-        # Use median and MAD (Median Absolute Deviation) for robust statistics
-        median_depth = np.median(valid_depths)
-        mad = np.median(np.abs(valid_depths - median_depth))
+        min_row, max_row = rows.min(), rows.max()
+        min_col, max_col = cols.min(), cols.max()
 
-        # Define depth range for clustering
-        depth_min = median_depth - self.depth_tolerance_mm
-        depth_max = median_depth + self.depth_tolerance_mm
+        # Extract median depth per row in seed region
+        # This allows different depth ranges for different vertical positions (head vs feet)
+        row_depth_ranges = {}
+        for row in range(min_row, max_row + 1):
+            row_mask = seed_mask[row, :] > 0
+            if np.any(row_mask):
+                row_depths = depth_image[row, row_mask]
+                valid_depths = row_depths[(row_depths > 300) & (row_depths < 5000)]
+                if len(valid_depths) > 0:
+                    median_depth = np.median(valid_depths)
+                    # Vertical direction: larger tolerance (60cm)
+                    row_depth_ranges[row] = (median_depth - self.depth_tolerance_z_mm,
+                                            median_depth + self.depth_tolerance_z_mm)
 
-        # Create depth-based mask: pixels with depth in valid range
-        depth_cluster_mask = ((depth_image >= depth_min) &
-                             (depth_image <= depth_max) &
-                             (depth_image > 0)).astype(np.uint8)
+        if len(row_depth_ranges) == 0:
+            self.get_logger().warning("No valid depth values in seed region, skipping clustering")
+            return rgb_mask
+
+        # Create anisotropic depth-based mask
+        # For each pixel, check if depth is within range of nearby seed rows
+        depth_cluster_mask = np.zeros_like(seed_mask)
+
+        for row in range(h):
+            # Find closest seed row with depth range
+            closest_rows = [r for r in row_depth_ranges.keys() if abs(r - row) <= 50]  # Within 50 pixels vertically
+            if not closest_rows:
+                continue
+
+            # Use depth range from closest seed row
+            closest_row = min(closest_rows, key=lambda r: abs(r - row))
+            depth_min, depth_max = row_depth_ranges[closest_row]
+
+            # For this row, apply horizontal tolerance (tighter)
+            row_depths = depth_image[row, :]
+            valid_pixels = (row_depths >= depth_min) & (row_depths <= depth_max) & (row_depths > 0)
+            depth_cluster_mask[row, valid_pixels] = 1
 
         # Morphological closing to fill small gaps
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
@@ -1083,14 +1104,14 @@ class RealtimeSTCNTracker(Node):
 
     def remove_ground_plane(self, points):
         """
-        Remove ground points by simple height filtering.
-        Removes all points below the height threshold in base_link frame.
+        Remove ground and ceiling points by height filtering.
+        Keeps only points between ground_height_threshold and ceiling_height_threshold.
 
         Args:
             points: Nx3 numpy array of points in base_link frame (X-forward, Y-left, Z-up)
 
         Returns:
-            filtered_points: Mx3 numpy array with ground points removed
+            filtered_points: Mx3 numpy array with ground and ceiling points removed
         """
         if points is None or len(points) < self.min_points_above_ground:
             return points
@@ -1102,20 +1123,20 @@ class RealtimeSTCNTracker(Node):
             n_points = len(points)
 
             # Filter by Z-axis height (Z-up in base_link frame)
-            # Keep only points above the height threshold
-            above_ground = points[:, 2] > self.ground_height_threshold
+            # Keep only points within valid height range
+            valid_height = (points[:, 2] > self.ground_height_threshold) & \
+                          (points[:, 2] < self.ceiling_height_threshold)
 
-            filtered_points = points[above_ground]
+            filtered_points = points[valid_height]
 
             # Safety check: ensure we didn't remove all points
             if len(filtered_points) < self.min_points_above_ground:
-                self.get_logger().warning("[Ground Removal] Too few points remaining (%d), returning original" % len(filtered_points))
                 return points
 
             return filtered_points
 
         except Exception as e:
-            self.get_logger().error("[Ground Removal] Failed: %s" % str(e))
+            self.get_logger().error("[Height Filter] Failed: %s" % str(e))
             import traceback
             self.get_logger().error(traceback.format_exc())
             return points
@@ -1446,15 +1467,11 @@ class RealtimeSTCNTracker(Node):
 
                     if combined_points is not None:
                         points_after_ground = len(combined_points)
-                        self.get_logger().info("[Ground Removal] %d -> %d points (removed %d)" %
-                                             (points_before_ground, points_after_ground,
-                                              points_before_ground - points_after_ground))
 
                         # Now downsample AFTER ground removal
                         if len(combined_points) > 5000:
                             indices = np.random.choice(len(combined_points), 5000, replace=False)
                             combined_points = combined_points[indices]
-                            self.get_logger().info("[Downsample] %d -> 5000 points" % points_after_ground)
 
                 # Publish combined pointcloud in base_link frame
                 if combined_points is not None:
