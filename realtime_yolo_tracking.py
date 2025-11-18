@@ -173,6 +173,11 @@ class YoloPointcloudReconstruction(Node):
         self.consecutive_outliers = 0  # Track consecutive outlier rejections
         self.max_outliers_before_reset = 5  # Reset KF after this many consecutive outliers
 
+        # Mask memory for close-range tracking (<1m)
+        self.last_valid_mask = None  # Store last valid mask
+        self.mask_memory_counter = 0  # Count frames since last valid detection
+        self.max_mask_memory_frames = 5  # Maximum frames to reuse mask
+
         # State
         self.bridge = CvBridge()
         self.lock = threading.Lock()
@@ -336,8 +341,17 @@ class YoloPointcloudReconstruction(Node):
         stitched = np.vstack([top_resized, bot_resized])
         return stitched
 
-    def yolo_detect_human(self, frame_bgr):
-        """Run YOLO to detect human and return mask of the one closest to center"""
+    def yolo_detect_human(self, frame_bgr, cylinder_center=None):
+        """
+        Run YOLO to detect human and return mask of the one closest to center.
+
+        Args:
+            frame_bgr: Stitched frame (top camera + bottom camera vertically stacked)
+            cylinder_center: (x, y, z) position of cylinder center in base_footprint frame, or None
+
+        Returns:
+            mask: Binary mask (0 or 255) of detected human
+        """
         h, w = frame_bgr.shape[:2]
         center_x = w * 0.5
         center_y = h * 0.5
@@ -364,6 +378,17 @@ class YoloPointcloudReconstruction(Node):
             agnostic_nms=False,            # Class-agnostic NMS
             retina_masks=True              # Use high-resolution segmentation masks
         )
+
+        # Check person distance and determine required bottom camera coverage
+        required_bottom_coverage = 0.0  # No requirement by default
+        if cylinder_center is not None:
+            distance = np.sqrt(cylinder_center[0]**2 + cylinder_center[1]**2)
+            if distance < 1.0:
+                # Very close: require 50% vertical coverage in bottom camera
+                required_bottom_coverage = 0.5
+            elif distance < 2.0:
+                # Medium distance: require 20% vertical coverage in bottom camera
+                required_bottom_coverage = 0.2
 
         # Find the mask closest to center - O(n) algorithm
         closest_mask = None
@@ -392,6 +417,53 @@ class YoloPointcloudReconstruction(Node):
                 if len(x_coords) == 0:
                     continue
 
+                # Enforce minimum camera coverage based on distance
+                if required_bottom_coverage > 0.0:
+                    # Calculate camera split (assume 50/50 split)
+                    top_camera_end_y = h // 2
+                    bottom_camera_start_y = h // 2
+
+                    # Check coverage in BOTTOM CAMERA UPPER HALF
+                    bottom_camera_height = h - bottom_camera_start_y
+                    bottom_camera_upper_half_end = bottom_camera_start_y + bottom_camera_height // 2
+
+                    # Find vertical extent in bottom camera upper half
+                    bottom_upper_y_coords = y_coords[(y_coords >= bottom_camera_start_y) &
+                                                     (y_coords < bottom_camera_upper_half_end)]
+
+                    if len(bottom_upper_y_coords) > 0:
+                        bottom_upper_height = bottom_camera_height // 2
+                        bottom_min = np.min(bottom_upper_y_coords) - bottom_camera_start_y
+                        bottom_max = np.max(bottom_upper_y_coords) - bottom_camera_start_y
+                        bottom_coverage = (bottom_max - bottom_min) / bottom_upper_height
+                    else:
+                        bottom_coverage = 0.0
+
+                    # Reject if bottom camera upper half coverage is below required threshold
+                    if bottom_coverage < required_bottom_coverage:
+                        continue
+
+                    # For very close range (<1m), also check top camera lower half
+                    if required_bottom_coverage >= 0.5:  # Only for <1m case
+                        top_camera_height = top_camera_end_y
+                        top_lower_half_start = top_camera_height // 2
+
+                        # Find vertical extent in top camera lower half
+                        top_lower_y_coords = y_coords[(y_coords >= top_lower_half_start) &
+                                                      (y_coords < top_camera_end_y)]
+
+                        if len(top_lower_y_coords) > 0:
+                            top_lower_height = top_camera_height - top_lower_half_start
+                            top_min = np.min(top_lower_y_coords) - top_lower_half_start
+                            top_max = np.max(top_lower_y_coords) - top_lower_half_start
+                            top_lower_coverage = (top_max - top_min) / top_lower_height
+                        else:
+                            top_lower_coverage = 0.0
+
+                        # Require at least 50% coverage in top camera lower half
+                        if top_lower_coverage < 0.5:
+                            continue
+
                 # Compute centroid
                 mask_center_x = np.mean(x_coords)
                 mask_center_y = np.mean(y_coords)
@@ -404,10 +476,27 @@ class YoloPointcloudReconstruction(Node):
                     min_distance = distance
                     closest_mask = mask
 
-        # Return the closest mask or empty mask
+        # Handle mask result with memory for close-range tracking
         if closest_mask is not None:
+            # Valid detection - store it and reset counter
+            self.last_valid_mask = closest_mask.copy()
+            self.mask_memory_counter = 0
             return closest_mask
         else:
+            # No detection - check if we should reuse last mask
+            person_is_close = False
+            if cylinder_center is not None:
+                distance = np.sqrt(cylinder_center[0]**2 + cylinder_center[1]**2)
+                person_is_close = distance < 1.0
+
+            # If person is close and we have a recent mask, reuse it
+            if person_is_close and self.last_valid_mask is not None:
+                self.mask_memory_counter += 1
+                if self.mask_memory_counter <= self.max_mask_memory_frames:
+                    # Reuse last valid mask
+                    return self.last_valid_mask.copy()
+
+            # Otherwise return empty mask
             return np.zeros((h, w), dtype=np.uint8)
 
     def extract_human_bbox(self, image, mask, expansion_ratio=0.1):
@@ -828,7 +917,13 @@ class YoloPointcloudReconstruction(Node):
 
         # 2. YOLO detection
         yolo_start = time.time()
-        stitched_mask = self.yolo_detect_human(stitched)
+        # Get previous cylinder center for close-range detection logic
+        prev_cylinder_center = None
+        if self.cylinder_initialized and self.cylinder_kf is not None:
+            prev_state = self.cylinder_kf.get_state()
+            prev_cylinder_center = (prev_state[0], prev_state[1], 0.0)  # (x, y, z=0 for simplicity)
+
+        stitched_mask = self.yolo_detect_human(stitched, cylinder_center=prev_cylinder_center)
         yolo_time = (time.time() - yolo_start) * 1000
 
         # 3. Split mask
