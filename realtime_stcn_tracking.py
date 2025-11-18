@@ -32,6 +32,9 @@ import torch.nn.functional as F
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, PointCloud2, PointField, CameraInfo
 from sensor_msgs_py import point_cloud2 as pc2
+from visualization_msgs.msg import Marker
+from geometry_msgs.msg import Point, Quaternion
+from std_msgs.msg import Header
 from collections import deque
 import threading
 import subprocess
@@ -50,6 +53,91 @@ from model.eval_network import STCN
 from dataset.range_transform import im_normalization
 from dataset.util import all_to_onehot
 from model.aggregate import aggregate
+
+
+class CylinderKalmanFilter:
+    """
+    Kalman Filter for tracking cylinder parameters (x, y, radius, height).
+    State vector: [x, y, radius, height, vx, vy, vr, vh]
+    """
+    def __init__(self):
+        # State: [x, y, radius, height, vx, vy, vr, vh]
+        self.state = np.zeros(8)  # position + velocity
+
+        # State covariance matrix
+        self.P = np.eye(8) * 1000  # High initial uncertainty
+
+        # Process noise (how much we expect state to change)
+        self.Q = np.eye(8)
+        self.Q[0:2, 0:2] *= 0.01   # XY position noise (small, people move smoothly)
+        self.Q[2:4, 2:4] *= 0.001  # Size noise (very small, size doesn't change much)
+        self.Q[4:6, 4:6] *= 0.1    # XY velocity noise (larger, velocity can change)
+        self.Q[6:8, 6:8] *= 0.001  # Size velocity noise (very small, size velocity near zero)
+
+        # Measurement noise (uncertainty in observations)
+        self.R = np.eye(4)
+        self.R[0, 0] = 0.05  # x measurement noise (5cm)
+        self.R[1, 1] = 0.05  # y measurement noise (5cm)
+        self.R[2, 2] = 0.1   # radius measurement noise (10cm)
+        self.R[3, 3] = 0.1   # height measurement noise (10cm)
+
+        # Measurement matrix (we only observe position, not velocity)
+        self.H = np.zeros((4, 8))
+        self.H[0, 0] = 1  # Observe x
+        self.H[1, 1] = 1  # Observe y
+        self.H[2, 2] = 1  # Observe radius
+        self.H[3, 3] = 1  # Observe height
+
+        # Track number of consecutive prediction-only frames
+        self.prediction_only_count = 0
+        self.max_prediction_frames = 10  # Reset after this many frames without measurement
+
+    def predict(self, dt):
+        """Predict next state based on motion model"""
+        # State transition matrix (constant velocity model)
+        F = np.eye(8)
+        F[0, 4] = dt  # x = x + vx * dt
+        F[1, 5] = dt  # y = y + vy * dt
+        F[2, 6] = dt  # radius = radius + vr * dt
+        F[3, 7] = dt  # height = height + vh * dt
+
+        # Predict state
+        self.state = F @ self.state
+
+        # Constrain velocities to reasonable ranges (prevent explosion)
+        # Position velocity: max 2 m/s (human walking/running speed)
+        self.state[4] = np.clip(self.state[4], -2.0, 2.0)  # vx
+        self.state[5] = np.clip(self.state[5], -2.0, 2.0)  # vy
+
+        # Size velocity: max 0.1 m/s (size shouldn't change rapidly)
+        self.state[6] = np.clip(self.state[6], -0.1, 0.1)  # vr
+        self.state[7] = np.clip(self.state[7], -0.1, 0.1)  # vh
+
+        # Predict covariance
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update(self, measurement):
+        """Update state with new measurement [x, y, radius, height]"""
+        # Innovation (measurement residual)
+        z = np.array(measurement)
+        y = z - self.H @ self.state
+
+        # Innovation covariance
+        S = self.H @ self.P @ self.H.T + self.R
+
+        # Kalman gain
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+
+        # Update state
+        self.state = self.state + K @ y
+
+        # Update covariance
+        I = np.eye(8)
+        self.P = (I - K @ self.H) @ self.P
+
+    def get_state(self):
+        """Get current state [x, y, radius, height]"""
+        return self.state[0:4]
 
 
 class RealtimeSTCNTracker(Node):
@@ -81,8 +169,8 @@ class RealtimeSTCNTracker(Node):
         self.mask_area_history = deque(maxlen=10)  # Track mask area history for trend detection
 
         # Depth-based region growing parameters
-        self.depth_tolerance_mm = 400  # Allow depth variation for clustering (horizontal)
-        self.depth_tolerance_z_mm = 600  # Allow larger depth variation in Z direction (vertical, 60cm)
+        self.depth_tolerance_mm = 100  # Allow depth variation for clustering (horizontal)
+        self.depth_tolerance_z_mm = 300  # Allow larger depth variation in Z direction (vertical, 60cm)
         self.min_cluster_size = 500  # Minimum pixels for a valid cluster
         self.morph_kernel_size = 3  # Kernel size for morphological operations
 
@@ -116,7 +204,7 @@ class RealtimeSTCNTracker(Node):
         self.cam01_intrinsics = None
         self.cam02_intrinsics = None
 
-        # TF buffer for transforming pointclouds to base_link
+        # TF buffer for transforming pointclouds to base_footprint
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -193,15 +281,26 @@ class RealtimeSTCNTracker(Node):
         self.sub_cam02_depth = self.create_subscription(
             Image, '/camera_02/depth/image_raw', self.callback_cam02_depth, 1)
 
-        # Publisher - Combined human pointcloud in base_link frame
+        # Publisher - Combined human pointcloud in base_footprint frame
         self.pub_human_pc = self.create_publisher(
             PointCloud2, '/human_pointcloud', 1)
+
+        # Publisher - Cylindrical bounding box marker
+        self.pub_cylinder_marker = self.create_publisher(
+            Marker, '/human_cylinder', 1)
 
         # Publishers - Masks (for debugging)
         self.pub_mask01 = self.create_publisher(
             Image, '/camera_01/human_mask', 1)
         self.pub_mask02 = self.create_publisher(
             Image, '/camera_02/human_mask', 1)
+
+        # Kalman filter for cylinder tracking
+        self.cylinder_kf = None
+        self.last_cylinder_time = None
+        self.cylinder_initialized = False
+        self.consecutive_outliers = 0
+        self.max_outliers_before_reset = 5
 
 
         # Processing flag to prevent concurrent processing
@@ -285,21 +384,25 @@ class RealtimeSTCNTracker(Node):
 
     def stitch_images(self, img_top, img_bottom):
         """上下摄像头透视变换后拼接"""
-        # Warp top camera
-        h0, w0 = img_top.shape[:2]
-        src0 = np.float32([[0, 0], [w0, 0], [w0, h0], [0, h0]])
-        offset0 = int(w0 * self.angle_degrees / 90)
-        dst0 = np.float32([[0, 0], [w0, 0], [w0 - offset0, h0], [offset0, h0]])
-        M0 = cv2.getPerspectiveTransform(src0, dst0)
-        warped_top = cv2.warpPerspective(img_top, M0, (w0, h0))
+        # # Warp top camera
+        # h0, w0 = img_top.shape[:2]
+        # src0 = np.float32([[0, 0], [w0, 0], [w0, h0], [0, h0]])
+        # offset0 = int(w0 * self.angle_degrees / 90)
+        # dst0 = np.float32([[0, 0], [w0, 0], [w0 - offset0, h0], [offset0, h0]])
+        # M0 = cv2.getPerspectiveTransform(src0, dst0)
+        # warped_top = cv2.warpPerspective(img_top, M0, (w0, h0))
 
-        # Warp bottom camera
-        h1, w1 = img_bottom.shape[:2]
-        src1 = np.float32([[0, 0], [w1, 0], [w1, h1], [0, h1]])
-        offset1 = int(w1 * self.angle_degrees / 90)
-        dst1 = np.float32([[offset1, 0], [w1 - offset1, 0], [w1, h1], [0, h1]])
-        M1 = cv2.getPerspectiveTransform(src1, dst1)
-        warped_bottom = cv2.warpPerspective(img_bottom, M1, (w1, h1))
+        # # Warp bottom camera
+        # h1, w1 = img_bottom.shape[:2]
+        # src1 = np.float32([[0, 0], [w1, 0], [w1, h1], [0, h1]])
+        # offset1 = int(w1 * self.angle_degrees / 90)
+        # dst1 = np.float32([[offset1, 0], [w1 - offset1, 0], [w1, h1], [0, h1]])
+        # M1 = cv2.getPerspectiveTransform(src1, dst1)
+        # warped_bottom = cv2.warpPerspective(img_bottom, M1, (w1, h1))
+
+        # Skip perspective warp - directly use original images
+        warped_top = img_top
+        warped_bottom = img_bottom
 
         # Resize to common width and stack
         w_common = min(warped_top.shape[1], warped_bottom.shape[1])
@@ -795,7 +898,7 @@ class RealtimeSTCNTracker(Node):
         Args:
             points: Nx3 numpy array of 3D points
             v_coords: N array of v (vertical) pixel coordinates in downsampled image space
-            camera_frame: 'camera_01_link' or 'camera_02_link'
+            camera_frame: 'camera_1' or 'camera_0'
             seam_v_position: Vertical pixel position of seam in downsampled image
 
         Returns:
@@ -901,16 +1004,15 @@ class RealtimeSTCNTracker(Node):
 
     def grow_mask_with_depth_clustering(self, rgb_mask, depth_image):
         """
-        Use depth clustering to grow the RGB mask and capture the full human region.
-        Uses anisotropic depth tolerance: larger in vertical direction (60cm) for human height,
-        smaller in horizontal direction (30cm) to avoid neighboring objects.
+        Region growing from STCN mask edges based on depth similarity to edge pixels.
+        All pixels are compared to the original edge depth, not recursively.
 
         Args:
             rgb_mask: Binary mask from RGB tracking (uint8, 0 or 255)
             depth_image: Depth image in mm (uint16 or float)
 
         Returns:
-            expanded_mask: Grown mask that includes full human region (uint8, 0 or 255)
+            expanded_mask: Grown mask (uint8, 0 or 255)
         """
         if rgb_mask is None or depth_image is None:
             return rgb_mask
@@ -926,118 +1028,73 @@ class RealtimeSTCNTracker(Node):
         # Check if seed mask is valid
         seed_pixels = np.count_nonzero(seed_mask)
         if seed_pixels < self.min_cluster_size:
-            self.get_logger().warning("Seed mask too small (%d pixels), skipping depth clustering" % seed_pixels)
             return rgb_mask
 
-        # Extract depth statistics from seed region for each row (vertical direction)
         h, w = depth_image.shape
 
-        # Find bounding box of seed mask
-        rows, cols = np.where(seed_mask > 0)
-        if len(rows) == 0:
+        # Find edges of seed mask (boundary pixels)
+        kernel = np.ones((3, 3), np.uint8)
+        eroded = cv2.erode(seed_mask, kernel, iterations=1)
+        edge_mask = seed_mask - eroded
+
+        # Get edge pixel depths as reference
+        edge_depths = depth_image[edge_mask > 0]
+        valid_edge_depths = edge_depths[(edge_depths > 300) & (edge_depths < 5000)]
+
+        if len(valid_edge_depths) < 10:
             return rgb_mask
 
-        min_row, max_row = rows.min(), rows.max()
-        min_col, max_col = cols.min(), cols.max()
+        # Use median edge depth as reference
+        reference_depth = np.median(valid_edge_depths)
+        depth_min = reference_depth - self.depth_tolerance_z_mm
+        depth_max = reference_depth + self.depth_tolerance_z_mm
 
-        # Extract median depth per row in seed region
-        # This allows different depth ranges for different vertical positions (head vs feet)
-        row_depth_ranges = {}
-        for row in range(min_row, max_row + 1):
-            row_mask = seed_mask[row, :] > 0
-            if np.any(row_mask):
-                row_depths = depth_image[row, row_mask]
-                valid_depths = row_depths[(row_depths > 300) & (row_depths < 5000)]
-                if len(valid_depths) > 0:
-                    median_depth = np.median(valid_depths)
-                    # Vertical direction: larger tolerance (60cm)
-                    row_depth_ranges[row] = (median_depth - self.depth_tolerance_z_mm,
-                                            median_depth + self.depth_tolerance_z_mm)
+        # Dilate seed mask to get search region (limit growing distance)
+        # Use larger kernel with fewer iterations for speed
+        max_grow_pixels = 30  # Maximum growing distance in pixels
+        kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max_grow_pixels*2+1, max_grow_pixels*2+1))
+        dilated = cv2.dilate(seed_mask, kernel_large, iterations=1)
+        search_region = dilated - seed_mask  # Only search outside seed
 
-        if len(row_depth_ranges) == 0:
-            self.get_logger().warning("No valid depth values in seed region, skipping clustering")
-            return rgb_mask
+        # Apply depth filter in search region
+        # Compare ALL candidates to reference_depth (not recursive)
+        candidate_depths = depth_image * search_region
+        valid_candidates = (candidate_depths >= depth_min) & \
+                          (candidate_depths <= depth_max) & \
+                          (candidate_depths > 0)
 
-        # Create anisotropic depth-based mask
-        # For each pixel, check if depth is within range of nearby seed rows
-        depth_cluster_mask = np.zeros_like(seed_mask)
-
-        for row in range(h):
-            # Find closest seed row with depth range
-            closest_rows = [r for r in row_depth_ranges.keys() if abs(r - row) <= 50]  # Within 50 pixels vertically
-            if not closest_rows:
-                continue
-
-            # Use depth range from closest seed row
-            closest_row = min(closest_rows, key=lambda r: abs(r - row))
-            depth_min, depth_max = row_depth_ranges[closest_row]
-
-            # For this row, apply horizontal tolerance (tighter)
-            row_depths = depth_image[row, :]
-            valid_pixels = (row_depths >= depth_min) & (row_depths <= depth_max) & (row_depths > 0)
-            depth_cluster_mask[row, valid_pixels] = 1
-
-        # Morphological closing to fill small gaps
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                          (self.morph_kernel_size, self.morph_kernel_size))
-        depth_cluster_mask = cv2.morphologyEx(depth_cluster_mask, cv2.MORPH_CLOSE, kernel)
-
-        # Find connected components in the depth cluster mask
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            depth_cluster_mask, connectivity=8
-        )
-
-        # Find which component(s) overlap with the seed mask
-        seed_labels = np.unique(labels[seed_mask > 0])
-        seed_labels = seed_labels[seed_labels != 0]  # Remove background label
-
-        if len(seed_labels) == 0:
-            self.get_logger().warning("No depth cluster overlaps with seed mask")
-            return rgb_mask
-
-        # Create expanded mask from all components that overlap with seed
-        expanded_mask = np.zeros_like(depth_cluster_mask)
-        for label in seed_labels:
-            component_mask = (labels == label).astype(np.uint8)
-            component_size = stats[label, cv2.CC_STAT_AREA]
-
-            # Only include components that are large enough
-            if component_size >= self.min_cluster_size:
-                expanded_mask = np.maximum(expanded_mask, component_mask)
-
-        # Morphological opening to remove small noise
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        expanded_mask = cv2.morphologyEx(expanded_mask, cv2.MORPH_OPEN, kernel_open)
+        # Combine seed with valid grown region
+        grown_mask = seed_mask | valid_candidates.astype(np.uint8)
 
         # Convert back to 0-255 range
-        expanded_mask = (expanded_mask * 255).astype(np.uint8)
+        expanded_mask = (grown_mask * 255).astype(np.uint8)
 
         return expanded_mask
 
     def transform_and_combine_pointclouds(self, points01, points02, timestamp):
         """
-        Transform both pointclouds to base_link frame, concatenate, and downsample.
+        Transform both pointclouds to base_footprint frame, concatenate, and downsample.
 
         Args:
-            points01: Nx3 numpy array of points in camera_01_link frame (or None)
-            points02: Nx3 numpy array of points in camera_02_link frame (or None)
+            points01: Nx3 numpy array of points in camera_1 frame (or None)
+            points02: Nx3 numpy array of points in camera_0 frame (or None)
             timestamp: rospy.Time timestamp for TF lookup
 
         Returns:
-            Nx3 numpy array of combined points in base_link frame, or None if both inputs are None
+            Nx3 numpy array of combined points in base_footprint frame, or None if both inputs are None
         """
         combined_points = []
         points01_base = None
         points02_base = None
 
-        # Transform camera 01 points to base_link
+        # Transform camera 01 points to base_footprint
         if points01 is not None and len(points01) > 0:
             try:
-                # Lookup transform from camera to base_link
+                # Lookup transform from camera to base_footprint
                 # Use Time() to get the latest available transform (like rospy.Time(0) in ROS1)
                 from rclpy.time import Time
                 transform = self.tf_buffer.lookup_transform(
-                    'base_link', 'camera_01_link', Time(), rclpy.duration.Duration(seconds=1.0)
+                    'base_footprint', 'camera_1', Time(), rclpy.duration.Duration(seconds=1.0)
                 )
 
                 # Extract rotation and translation
@@ -1062,14 +1119,14 @@ class RealtimeSTCNTracker(Node):
                     ExtrapolationException) as e:
                 self.get_logger().warning("Failed to lookup transform for camera 01: %s" % str(e))
 
-        # Transform camera 02 points to base_link
+        # Transform camera 02 points to base_footprint
         if points02 is not None and len(points02) > 0:
             try:
-                # Lookup transform from camera to base_link
+                # Lookup transform from camera to base_footprint
                 # Use Time() to get the latest available transform (like rospy.Time(0) in ROS1)
                 from rclpy.time import Time
                 transform = self.tf_buffer.lookup_transform(
-                    'base_link', 'camera_02_link', Time(), rclpy.duration.Duration(seconds=1.0)
+                    'base_footprint', 'camera_0', Time(), rclpy.duration.Duration(seconds=1.0)
                 )
 
                 # Extract rotation and translation
@@ -1108,7 +1165,7 @@ class RealtimeSTCNTracker(Node):
         Keeps only points between ground_height_threshold and ceiling_height_threshold.
 
         Args:
-            points: Nx3 numpy array of points in base_link frame (X-forward, Y-left, Z-up)
+            points: Nx3 numpy array of points in base_footprint frame (X-forward, Y-left, Z-up)
 
         Returns:
             filtered_points: Mx3 numpy array with ground and ceiling points removed
@@ -1122,7 +1179,7 @@ class RealtimeSTCNTracker(Node):
         try:
             n_points = len(points)
 
-            # Filter by Z-axis height (Z-up in base_link frame)
+            # Filter by Z-axis height (Z-up in base_footprint frame)
             # Keep only points within valid height range
             valid_height = (points[:, 2] > self.ground_height_threshold) & \
                           (points[:, 2] < self.ceiling_height_threshold)
@@ -1141,8 +1198,222 @@ class RealtimeSTCNTracker(Node):
             self.get_logger().error(traceback.format_exc())
             return points
 
+    def filter_outliers_by_cylindrical_distance(self, points, iqr_multiplier=1.5):
+        """
+        Filter outliers based on radial distance from central vertical axis.
+        Central axis is defined by XY center of pointcloud, Z from 0 to 1.8m.
+
+        Args:
+            points: Nx3 numpy array in base_footprint frame (X-forward, Y-left, Z-up)
+            iqr_multiplier: multiplier for IQR (default 1.5)
+
+        Returns:
+            filtered_points: Points with outliers removed
+        """
+        if points is None or len(points) < 100:
+            return points
+
+        # Compute center of XY projection
+        center_x = np.mean(points[:, 0])
+        center_y = np.mean(points[:, 1])
+
+        # Calculate radial distance from central axis (distance in XY plane)
+        radial_distances = np.sqrt((points[:, 0] - center_x)**2 +
+                                   (points[:, 1] - center_y)**2)
+
+        # Use IQR method to filter radial outliers
+        Q1 = np.percentile(radial_distances, 25)
+        Q3 = np.percentile(radial_distances, 75)
+        IQR = Q3 - Q1
+
+        # Calculate outlier bounds
+        radius_max = Q3 + iqr_multiplier * IQR
+
+        # Filter points by radial distance
+        valid_radial = radial_distances <= radius_max
+
+        # Also filter by Z height (0 to 1.8m)
+        valid_height = (points[:, 2] >= 0.0) & (points[:, 2] <= 1.8)
+
+        # Combine filters
+        valid_points = valid_radial & valid_height
+
+        filtered_points = points[valid_points]
+
+        return filtered_points if len(filtered_points) >= 100 else points
+
+    def compute_cylinder_bounding_box(self, points, expansion_ratio=0.05):
+        """
+        Compute cylindrical bounding box parameters around human pointcloud.
+        Cylinder axis is Z (vertical), bottom at ground (Z=0), grows outward by expansion_ratio.
+
+        Args:
+            points: Nx3 numpy array in base_footprint frame (X-forward, Y-left, Z-up)
+            expansion_ratio: Ratio to expand radius and height (default 5%)
+
+        Returns:
+            (center_x, center_y, center_z, radius, height): Cylinder parameters
+        """
+        if points is None or len(points) < 10:
+            return None
+
+        # Get XY projection (horizontal plane)
+        xy_points = points[:, :2]  # [X, Y]
+
+        # Compute center of XY projection
+        center_x = np.mean(xy_points[:, 0])
+        center_y = np.mean(xy_points[:, 1])
+
+        # Compute radius as max distance from center in XY plane
+        distances = np.sqrt((xy_points[:, 0] - center_x)**2 + (xy_points[:, 1] - center_y)**2)
+        base_radius = np.max(distances)
+
+        # Expand radius by expansion_ratio
+        radius = base_radius * (1.0 + expansion_ratio)
+
+        # Ensure radius is within [0.4m, 1.0m]
+        radius = max(0.4, min(radius, 1.0))
+
+        # Get Z range (height)
+        # Bottom is always at ground (Z=0)
+        z_bottom = 0.0
+        z_max = np.max(points[:, 2])
+
+        # Expand top by expansion_ratio
+        height = z_max * (1.0 + expansion_ratio)
+
+        # Ensure height is within reasonable range (max 2.0m)
+        height = min(height, 2.0)
+
+        # Center Z is at half height (since bottom is at 0)
+        center_z = height / 2.0
+
+        return (center_x, center_y, center_z, radius, height)
+
+    def update_cylinder_with_kalman(self, measured_params, current_time):
+        """
+        Update cylinder parameters using Kalman filter for smooth tracking.
+        Includes innovation gating to reject outlier measurements.
+
+        Args:
+            measured_params: (center_x, center_y, center_z, radius, height) from point cloud, or None
+            current_time: Current timestamp in seconds
+
+        Returns:
+            (center_x, center_y, center_z, radius, height): Filtered parameters, or None if no state
+        """
+        if measured_params is None:
+            # No measurement, just predict
+            if self.cylinder_kf is not None and self.last_cylinder_time is not None:
+                dt = current_time - self.last_cylinder_time
+                if dt > 0 and dt < 1.0:
+                    self.cylinder_kf.predict(dt)
+                    self.last_cylinder_time = current_time
+                    filtered_state = self.cylinder_kf.get_state()
+
+                    # Apply constraints even in prediction mode
+                    filtered_x = filtered_state[0]
+                    filtered_y = filtered_state[1]
+                    filtered_radius = np.clip(filtered_state[2], 0.4, 1.0)
+                    filtered_height = np.clip(filtered_state[3], 0.5, 2.5)
+
+                    # Update state with constraints to prevent drift
+                    self.cylinder_kf.state[2] = filtered_radius
+                    self.cylinder_kf.state[3] = filtered_height
+
+                    center_z = filtered_height / 2.0
+                    return (filtered_x, filtered_y, center_z, filtered_radius, filtered_height)
+            return None
+
+        center_x, center_y, center_z, radius, height = measured_params
+
+        # Initialize Kalman filter on first measurement
+        if not self.cylinder_initialized:
+            self.cylinder_kf = CylinderKalmanFilter()
+            self.cylinder_kf.state[0:4] = [center_x, center_y, radius, height]
+            self.cylinder_kf.state[4:8] = 0  # Initialize velocities to zero
+            self.last_cylinder_time = current_time
+            self.cylinder_initialized = True
+            return measured_params
+
+        # Calculate time delta
+        dt = current_time - self.last_cylinder_time
+        self.last_cylinder_time = current_time
+
+        # Sanity check on dt
+        if dt <= 0 or dt > 1.0:
+            self.cylinder_kf.state[0:4] = [center_x, center_y, radius, height]
+            self.cylinder_kf.state[4:8] = 0
+            return measured_params
+
+        # Predict step
+        self.cylinder_kf.predict(dt)
+
+        # Innovation gating: Check if measurement is too far from prediction
+        predicted_state = self.cylinder_kf.get_state()
+        measurement = np.array([center_x, center_y, radius, height])
+        innovation = measurement - predicted_state
+
+        position_error = np.sqrt(innovation[0]**2 + innovation[1]**2)
+        size_error = np.sqrt(innovation[2]**2 + innovation[3]**2)
+
+        # Gating thresholds
+        max_position_jump = 1.5
+        max_size_jump = 0.8
+
+        if position_error > max_position_jump or size_error > max_size_jump:
+            self.consecutive_outliers += 1
+
+            # If too many consecutive outliers, reinitialize
+            if self.consecutive_outliers >= self.max_outliers_before_reset:
+                self.cylinder_kf.state[0:4] = [center_x, center_y, radius, height]
+                self.cylinder_kf.state[4:8] = 0
+                self.cylinder_kf.P = np.eye(8) * 1000
+                self.consecutive_outliers = 0
+                return measured_params
+            else:
+                # Don't update, just return predicted state with constraints
+                filtered_x = predicted_state[0]
+                filtered_y = predicted_state[1]
+                filtered_radius = np.clip(predicted_state[2], 0.4, 1.0)
+                filtered_height = np.clip(predicted_state[3], 0.5, 2.5)
+
+                self.cylinder_kf.state[2] = filtered_radius
+                self.cylinder_kf.state[3] = filtered_height
+
+                center_z = filtered_height / 2.0
+                return (filtered_x, filtered_y, center_z, filtered_radius, filtered_height)
+
+        # Update step with measurement (measurement is valid)
+        self.cylinder_kf.update(measurement)
+
+        # Reset outlier counter on successful update
+        self.consecutive_outliers = 0
+
+        # Get filtered state
+        filtered_state = self.cylinder_kf.get_state()
+
+        # Apply constraints to filtered state
+        filtered_x = filtered_state[0]
+        filtered_y = filtered_state[1]
+        filtered_radius = np.clip(filtered_state[2], 0.4, 1.0)
+        filtered_height = np.clip(filtered_state[3], 0.5, 2.5)
+
+        # Update state with constraints (prevent drift)
+        self.cylinder_kf.state[2] = filtered_radius
+        self.cylinder_kf.state[3] = filtered_height
+
+        # Calculate center_z (half of height, since bottom is at 0)
+        filtered_center_z = filtered_height / 2.0
+
+        return (filtered_x, filtered_y, filtered_center_z, filtered_radius, filtered_height)
+
     def process_frame(self, event=None):
         """Main processing loop"""
+        frame_start_time = time.time()
+
+        # Stage 1: Image acquisition and preprocessing
+        preprocess_start = time.time()
         with self.lock:
             if self.camera_01_img is None or self.camera_02_img is None:
                 return
@@ -1160,6 +1431,7 @@ class RealtimeSTCNTracker(Node):
 
         # Convert to tensor
         frame_tensor, frame_rgb = self.frame_to_tensor(stitched_bgr)
+        preprocess_time = (time.time() - preprocess_start) * 1000
 
         # Store frame in buffer (only needed before tracking initialization)
         if not self.tracking_initialized:
@@ -1199,9 +1471,10 @@ class RealtimeSTCNTracker(Node):
         else:
             # Tracking phase - first track, then check if target is lost
             # Always try to track first
+            tracking_start = time.time()
             try:
                 mask, track_time = self.track_frame(frame_tensor, orig_size)
-                self.get_logger().info("[STCN Tracking] Frame %d: %.3f ms" % (self.current_frame_idx, track_time * 1000))
+                tracking_time = (time.time() - tracking_start) * 1000
             except RuntimeError as e:
                     if "out of memory" in str(e):
                         self.get_logger().error("OOM! Clearing memory and reducing memory bank...")
@@ -1322,11 +1595,15 @@ class RealtimeSTCNTracker(Node):
                         # Use merged mask for this frame
                         mask = merged_mask
 
+        # Stage 3: Pointcloud generation and publishing
+        pointcloud_start = time.time()
+
         # Publish pointclouds for each camera
         if mask is not None:
             # Split mask back to individual cameras
             # The stitched image was created by stacking top and bottom
             # We need to reverse this process
+            mask_split_start = time.time()
             with self.lock:
                 depth01 = self.camera_01_depth.copy() if self.camera_01_depth is not None else None
                 depth02 = self.camera_02_depth.copy() if self.camera_02_depth is not None else None
@@ -1380,33 +1657,36 @@ class RealtimeSTCNTracker(Node):
                 # Upscale mask to original resolution for depth (1280x720)
                 mask_cam02 = cv2.resize(mask_cam02_ds, (orig_w2, orig_h2), interpolation=cv2.INTER_NEAREST)
 
+                mask_split_time = (time.time() - mask_split_start) * 1000
+
                 # Apply depth-based region growing to expand incomplete masks
-                # This uses depth clustering to recover missing parts of the human
-                # Temporarily disabled to debug pointcloud generation
-                mask_cam01_expanded = self.grow_mask_with_depth_clustering(mask_cam01, depth01)
-                mask_cam02_expanded = self.grow_mask_with_depth_clustering(mask_cam02, depth02)
+                depth_cluster_start = time.time()
+                # mask_cam01_expanded = self.grow_mask_with_depth_clustering(mask_cam01, depth01)
+                # mask_cam02_expanded = self.grow_mask_with_depth_clustering(mask_cam02, depth02)
+                depth_cluster_time = (time.time() - depth_cluster_start) * 1000
 
                 # Use expanded masks for pointcloud generation
-                mask_cam01 = mask_cam01_expanded
-                mask_cam02 = mask_cam02_expanded
+                # mask_cam01 = mask_cam01_expanded
+                # mask_cam02 = mask_cam02_expanded
 
                 # Publish masks for debugging - use original camera timestamps
                 try:
                     mask_msg01 = self.bridge.cv2_to_imgmsg(mask_cam01, encoding="mono8")
                     # Use original camera timestamp for proper synchronization in RViz
                     mask_msg01.header.stamp = self.camera_01_timestamp if self.camera_01_timestamp else self.get_clock().now().to_msg()
-                    mask_msg01.header.frame_id = 'camera_01_link'
+                    mask_msg01.header.frame_id = 'camera_1'
                     self.pub_mask01.publish(mask_msg01)
 
                     mask_msg02 = self.bridge.cv2_to_imgmsg(mask_cam02, encoding="mono8")
                     # Use original camera timestamp for proper synchronization in RViz
                     mask_msg02.header.stamp = self.camera_02_timestamp if self.camera_02_timestamp else self.get_clock().now().to_msg()
-                    mask_msg02.header.frame_id = 'camera_02_link'
+                    mask_msg02.header.frame_id = 'camera_0'
                     self.pub_mask02.publish(mask_msg02)
                 except Exception as e:
                     self.get_logger().error("Failed to publish masks: %s" % str(e))
 
                 # Generate pointclouds from both cameras with seam-based downsampling
+                pc_gen_start = time.time()
                 timestamp = self.get_clock().now().to_msg()
                 points01, points02 = None, None
 
@@ -1422,7 +1702,7 @@ class RealtimeSTCNTracker(Node):
                 # Extract points from camera 01 with seam-based downsampling
                 if self.cam01_intrinsics is not None:
                     result = self.depth_to_pointcloud(
-                        depth01, mask_cam01, 'camera_01_link',
+                        depth01, mask_cam01, 'camera_1',
                         self.cam01_intrinsics, timestamp, max_points=None
                     )
                     if result[0] is not None:
@@ -1432,7 +1712,7 @@ class RealtimeSTCNTracker(Node):
                         # Apply seam-based downsampling
                         if v_coords01 is not None:
                             points01 = self.downsample_by_seam_distance(
-                                points01_raw, v_coords01, 'camera_01_link', seam_v_cam01
+                                points01_raw, v_coords01, 'camera_1', seam_v_cam01
                             )
                         else:
                             points01 = points01_raw
@@ -1440,7 +1720,7 @@ class RealtimeSTCNTracker(Node):
                 # Extract points from camera 02 with seam-based downsampling
                 if self.cam02_intrinsics is not None:
                     result = self.depth_to_pointcloud(
-                        depth02, mask_cam02, 'camera_02_link',
+                        depth02, mask_cam02, 'camera_0',
                         self.cam02_intrinsics, timestamp, max_points=None
                     )
                     if result[0] is not None:
@@ -1450,17 +1730,22 @@ class RealtimeSTCNTracker(Node):
                         # Apply seam-based downsampling
                         if v_coords02 is not None:
                             points02 = self.downsample_by_seam_distance(
-                                points02_raw, v_coords02, 'camera_02_link', seam_v_cam02
+                                points02_raw, v_coords02, 'camera_0', seam_v_cam02
                             )
                         else:
                             points02 = points02_raw
 
-                # Transform both pointclouds to base_link and concatenate (no downsampling yet)
+                pc_gen_time = (time.time() - pc_gen_start) * 1000
+
+                # Transform both pointclouds to base_footprint and concatenate
+                tf_start = time.time()
                 combined_points, points01_base, points02_base = self.transform_and_combine_pointclouds(
                     points01, points02, timestamp
                 )
+                tf_time = (time.time() - tf_start) * 1000
 
-                # Remove ground plane FIRST, then downsample
+                # Remove ground plane and downsample
+                filter_start = time.time()
                 if combined_points is not None:
                     points_before_ground = len(combined_points)
                     combined_points = self.remove_ground_plane(combined_points)
@@ -1468,17 +1753,24 @@ class RealtimeSTCNTracker(Node):
                     if combined_points is not None:
                         points_after_ground = len(combined_points)
 
-                        # Now downsample AFTER ground removal
+                        # Filter outliers by cylindrical distance from central axis
+                        points_before_outlier = len(combined_points)
+                        combined_points = self.filter_outliers_by_cylindrical_distance(combined_points, iqr_multiplier=1.2)
+                        points_after_outlier = len(combined_points)
+
+                        # Now downsample AFTER ground removal and outlier filtering
                         if len(combined_points) > 5000:
                             indices = np.random.choice(len(combined_points), 5000, replace=False)
                             combined_points = combined_points[indices]
+                filter_time = (time.time() - filter_start) * 1000
 
-                # Publish combined pointcloud in base_link frame
+                # Publish combined pointcloud in base_footprint frame
+                publish_start = time.time()
                 if combined_points is not None:
                     from std_msgs.msg import Header
                     header = Header()
                     header.stamp = timestamp
-                    header.frame_id = 'base_link'
+                    header.frame_id = 'base_footprint'
                     fields = [
                         PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
                         PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
@@ -1486,6 +1778,117 @@ class RealtimeSTCNTracker(Node):
                     ]
                     pc_msg = pc2.create_cloud(header, fields, combined_points)
                     self.pub_human_pc.publish(pc_msg)
+
+                    # Compute and publish cylindrical bounding box with Kalman filtering
+                    measured_cylinder_params = self.compute_cylinder_bounding_box(combined_points, expansion_ratio=0.05)
+                    current_time = time.time()
+                    filtered_params = self.update_cylinder_with_kalman(measured_cylinder_params, current_time)
+
+                    if filtered_params is not None:
+                        center_x, center_y, center_z, radius, height = filtered_params
+
+                        # Create cylinder marker
+                        marker = Marker()
+                        marker.header.frame_id = 'base_footprint'
+                        marker.header.stamp = timestamp
+                        marker.ns = 'human_cylinder'
+                        marker.id = 0
+                        marker.type = Marker.CYLINDER
+                        marker.action = Marker.ADD
+
+                        # Set position (center of cylinder)
+                        marker.pose.position.x = center_x
+                        marker.pose.position.y = center_y
+                        marker.pose.position.z = center_z
+
+                        # Set orientation (identity quaternion - cylinder aligned with Z-axis)
+                        marker.pose.orientation.x = 0.0
+                        marker.pose.orientation.y = 0.0
+                        marker.pose.orientation.z = 0.0
+                        marker.pose.orientation.w = 1.0
+
+                        # Set scale (diameter and height)
+                        marker.scale.x = radius * 2.0  # Diameter in X
+                        marker.scale.y = radius * 2.0  # Diameter in Y
+                        marker.scale.z = height        # Height in Z
+
+                        # Set color based on whether we have measurement or prediction
+                        if measured_cylinder_params is not None:
+                            # Have measurement: green
+                            marker.color.r = 0.0
+                            marker.color.g = 1.0
+                            marker.color.b = 0.0
+                        else:
+                            # Prediction only: yellow
+                            marker.color.r = 1.0
+                            marker.color.g = 1.0
+                            marker.color.b = 0.0
+                        marker.color.a = 0.3  # 30% opacity
+
+                        marker.lifetime = rclpy.duration.Duration(seconds=0.5).to_msg()
+
+                        self.pub_cylinder_marker.publish(marker)
+
+                publish_time = (time.time() - publish_start) * 1000
+
+                pointcloud_time = (time.time() - pointcloud_start) * 1000
+        else:
+            # No mask - still try to predict cylinder position
+            current_time = time.time()
+            filtered_params = self.update_cylinder_with_kalman(None, current_time)
+
+            if filtered_params is not None:
+                center_x, center_y, center_z, radius, height = filtered_params
+                timestamp = self.get_clock().now().to_msg()
+
+                # Create cylinder marker (yellow for prediction-only)
+                marker = Marker()
+                marker.header.frame_id = 'base_footprint'
+                marker.header.stamp = timestamp
+                marker.ns = 'human_cylinder'
+                marker.id = 0
+                marker.type = Marker.CYLINDER
+                marker.action = Marker.ADD
+
+                marker.pose.position.x = center_x
+                marker.pose.position.y = center_y
+                marker.pose.position.z = center_z
+
+                marker.pose.orientation.x = 0.0
+                marker.pose.orientation.y = 0.0
+                marker.pose.orientation.z = 0.0
+                marker.pose.orientation.w = 1.0
+
+                marker.scale.x = radius * 2.0
+                marker.scale.y = radius * 2.0
+                marker.scale.z = height
+
+                # Yellow for prediction-only mode
+                marker.color.r = 1.0
+                marker.color.g = 1.0
+                marker.color.b = 0.0
+                marker.color.a = 0.3
+
+                marker.lifetime = rclpy.duration.Duration(seconds=0.5).to_msg()
+
+                self.pub_cylinder_marker.publish(marker)
+
+        # Log total pipeline timing
+        total_time = (time.time() - frame_start_time) * 1000
+        if self.tracking_initialized and mask is not None:
+            self.get_logger().info(
+                "[Frame %d] Total: %.1f ms | Preprocess: %.1f ms | Track: %.1f ms | "
+                "MaskSplit: %.1f ms | DepthCluster: %.1f ms | PCGen: %.1f ms | TF: %.1f ms | "
+                "Filter: %.1f ms | Publish: %.1f ms" %
+                (self.current_frame_idx, total_time, preprocess_time,
+                 tracking_time if 'tracking_time' in locals() else 0,
+                 mask_split_time if 'mask_split_time' in locals() else 0,
+                 depth_cluster_time if 'depth_cluster_time' in locals() else 0,
+                 pc_gen_time if 'pc_gen_time' in locals() else 0,
+                 tf_time if 'tf_time' in locals() else 0,
+                 filter_time if 'filter_time' in locals() else 0,
+                 publish_time if 'publish_time' in locals() else 0)
+            )
 
         self.current_frame_idx += 1
 

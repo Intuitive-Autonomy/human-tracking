@@ -36,25 +36,25 @@ class YOLODetector:
         h, w = frame_bgr.shape[:2]
         cx_mid = w * 0.5
 
-        # Downsample to 320x360 for faster YOLO processing
-        # Input is 640x720 from main tracker, downsample to 320x360 (50% reduction)
-        target_w = 320
+        # Downsample to 640 width for better quality (compromise between speed and quality)
+        # For 1280x720 input, this gives 640x360
+        target_w = 640
         scale = target_w / w
         ds_h = int(h * scale)
         ds_w = target_w
 
         frame_ds = cv2.resize(frame_bgr, (ds_w, ds_h), interpolation=cv2.INTER_AREA)
 
-        # Use CPU to avoid CUDA context conflicts with main process
+        # Use CUDA for faster processing
         results = self.model.predict(
             frame_ds[..., ::-1],
             classes=[0],           # Person class only
             conf=self.conf_threshold,
             verbose=False,
-            device="cuda:0",          # Use CPU to avoid CUDA fork issues
+            device="cuda:0",       # Use CUDA
             half=False,
             amp=False,
-            imgsz=320,             # Match downsampled size
+            imgsz=640,             # Match downsampled size for better quality
             max_det=10             # Limit max detections for speed
         )
 
@@ -85,12 +85,12 @@ class YOLODetector:
 
                 # Resize mask to downsampled size first
                 if arr.shape[-2:] != (ds_h, ds_w):
-                    arr = cv2.resize(arr, (ds_w, ds_h), interpolation=cv2.INTER_NEAREST)
+                    arr = cv2.resize(arr, (ds_w, ds_h), interpolation=cv2.INTER_LINEAR)
 
                 mask_ds = (arr > 0.5).astype(np.uint8) * 255
 
-                # Upscale mask back to original size
-                mask = cv2.resize(mask_ds, (w, h), interpolation=cv2.INTER_NEAREST)
+                # Upscale mask back to original size using LINEAR interpolation for smoother result
+                mask = cv2.resize(mask_ds, (w, h), interpolation=cv2.INTER_LINEAR)
 
                 # Calculate centroid in original coordinates
                 M = cv2.moments(mask)

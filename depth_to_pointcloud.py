@@ -184,7 +184,7 @@ class DepthToPointCloudPublisher(Node):
             depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
 
             # Convert to pointcloud with original timestamp and intrinsics
-            pc_msg = self.depth_to_pointcloud(depth, 'camera_01_link', msg.header.stamp, self.cam01_intrinsics)
+            pc_msg = self.depth_to_pointcloud(depth, 'camera_1', msg.header.stamp, self.cam01_intrinsics)
 
             # Publish pointcloud
             if pc_msg is not None:
@@ -203,7 +203,7 @@ class DepthToPointCloudPublisher(Node):
             depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
 
             # Convert to pointcloud with original timestamp and intrinsics
-            pc_msg = self.depth_to_pointcloud(depth, 'camera_02_link', msg.header.stamp, self.cam02_intrinsics)
+            pc_msg = self.depth_to_pointcloud(depth, 'camera_0', msg.header.stamp, self.cam02_intrinsics)
 
             # Publish pointcloud
             if pc_msg is not None:
